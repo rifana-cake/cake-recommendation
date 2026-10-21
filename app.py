@@ -2,10 +2,17 @@ import base64
 import math
 import random
 import re
+import smtplib
+import sqlite3
+import tempfile
 import urllib.parse
+from datetime import datetime, time as dtime, timedelta, timezone
+from email.message import EmailMessage
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 from PIL import Image, ImageOps
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -79,6 +86,9 @@ TOPPINGS = {"Fresh Fruits": 100, "Chocolate Chips": 80, "Sprinkles": 50, "Oreo":
             "Kitkat / Gems": 150, "Edible Flowers": 200, "Cherries": 60, "Nuts": 100,
             "Macarons": 180, "Pearls": 80, "Gold Foil": 150, "Rose Petals": 100,
             "Marshmallows": 80, "Biscuit Crumbs": 90}
+
+INSTAGRAM_USER = "_femmora.bakes__"
+INSTAGRAM_URL = f"https://www.instagram.com/{INSTAGRAM_USER}/"
 
 PHOTO_DIR = Path(__file__).parent / "cake_photos"
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp"}
@@ -220,13 +230,184 @@ def realistic_prompt(colour_name, shape, flavour, cake_type, frosting, toppings,
         parts.append("decorated with " + ", ".join(t.lower() for t in toppings))
     if theme.strip():
         parts.append(f"{theme.strip()} theme decoration")
-    parts.append("on a cake stand, soft studio lighting, shallow depth of field, sharp focus, 4k, no text, no writing")
+    parts.append("real bakery cake, natural buttercream and sponge texture, shot on Canon EOS R5 85mm lens, soft natural window light, bakery display table, shallow depth of field, ultra detailed, real photograph, not an illustration, not a painting, not a 3D render, no text, no writing")
     return ", ".join(parts)
 
 
-def realistic_url(prompt, seed):
+def realistic_url(prompt, seed, model="flux"):
     return ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
-            + f"?width=768&height=768&nologo=true&model=flux&seed={seed}")
+            + f"?width=1024&height=1024&nologo=true&enhance=true&model={model}&seed={seed}")
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def get_secret(key):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return None
+
+
+def notify_owner(text, photo_bytes=None, svg_text=None, order_id=""):
+    """Send the order to the owner's Telegram. Returns (ok, error_message)."""
+    token = get_secret("TELEGRAM_BOT_TOKEN")
+    chat = get_secret("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return False, "Owner Telegram is not set up yet."
+    base = f"https://api.telegram.org/bot{token}"
+    try:
+        r = requests.post(f"{base}/sendMessage", data={"chat_id": chat, "text": text}, timeout=20)
+        if not (r.ok and r.json().get("ok")):
+            return False, f"Telegram error: {r.text[:150]}"
+        if photo_bytes:
+            requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"Reference image - {order_id}"},
+                          files={"photo": ("reference.jpg", photo_bytes)}, timeout=40)
+        if svg_text:
+            requests.post(f"{base}/sendDocument", data={"chat_id": chat, "caption": f"Cake design - {order_id} (open in browser)"},
+                          files={"document": (f"{order_id}_design.svg", svg_text.encode(), "image/svg+xml")}, timeout=40)
+        return True, ""
+    except Exception as e:
+        return False, f"Could not reach Telegram: {e}"
+
+
+STATUSES = ["New", "Confirmed", "Preparing", "Ready", "Delivered", "Cancelled"]
+
+
+def _db_path():
+    p = Path(__file__).parent / "orders.db"
+    try:
+        with open(p, "ab"):
+            pass
+        return str(p)
+    except Exception:
+        return str(Path(tempfile.gettempdir()) / "orders.db")
+
+
+def _db():
+    con = sqlite3.connect(_db_path())
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, created TEXT, name TEXT, phone TEXT, "
+        "delivery TEXT, need TEXT, cake_type TEXT, flavour TEXT, weight REAL, price INTEGER, status TEXT, "
+        "details TEXT, photo BLOB, design TEXT)"
+    )
+    return con
+
+
+def save_order(o):
+    try:
+        con = _db()
+        con.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (o["order_id"], o["created"], o["name"], o["phone"], o["delivery"], o["need"], o["cake_type"],
+             o["flavour"], o["weight"], o["price"], "New", o["details"], o["photo"], o["design"]),
+        )
+        con.commit()
+        con.close()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def list_orders():
+    con = _db()
+    df = pd.read_sql_query(
+        "SELECT order_id, created, name, phone, delivery, need, cake_type, flavour, weight, price, status "
+        "FROM orders ORDER BY created DESC", con)
+    con.close()
+    return df
+
+
+def get_order(order_id):
+    con = _db()
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def update_status(order_id, status):
+    con = _db()
+    con.execute("UPDATE orders SET status=? WHERE order_id=?", (status, order_id))
+    con.commit()
+    con.close()
+
+
+def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id=""):
+    """Email the order to the owner (Gmail + App Password)."""
+    user = get_secret("EMAIL_USER")
+    pw = get_secret("EMAIL_APP_PASSWORD")
+    to = get_secret("OWNER_EMAIL") or user
+    if not user or not pw:
+        return False, "Email is not set up yet."
+    try:
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = subject, user, to
+        msg.set_content(text)
+        if photo_bytes:
+            msg.add_attachment(photo_bytes, maintype="image", subtype="jpeg", filename="reference.jpg")
+        if svg_text:
+            msg.add_attachment(svg_text.encode(), maintype="image", subtype="svg+xml",
+                               filename=f"{order_id}_design.svg")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
+            server.login(user, str(pw).replace(" ", ""))
+            server.send_message(msg)
+        return True, ""
+    except Exception as e:
+        return False, f"Email error: {e}"
+
+
+def owner_dashboard():
+    st.title("🔐 Owner Dashboard")
+    pw = get_secret("OWNER_PASSWORD")
+    if not pw:
+        st.error("Owner password is not set. Add OWNER_PASSWORD in Streamlit Secrets.")
+        return
+    if not st.session_state.get("owner_ok"):
+        entered = st.text_input("Owner password", type="password")
+        if st.button("Login"):
+            if entered == str(pw):
+                st.session_state["owner_ok"] = True
+                st.rerun()
+            else:
+                st.error("Wrong password")
+        return
+    if st.button("Logout"):
+        st.session_state["owner_ok"] = False
+        st.rerun()
+
+    df = list_orders()
+    if df.empty:
+        st.info("No orders yet.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total orders", len(df))
+    c2.metric("New", int((df["status"] == "New").sum()))
+    c3.metric("Est. revenue", f"₹{int(df['price'].sum())}")
+    flt = st.selectbox("Filter by status", ["All"] + STATUSES)
+    view = df if flt == "All" else df[df["status"] == flt]
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Download all orders (CSV)", df.to_csv(index=False), "orders.csv", "text/csv")
+    st.caption("Note: orders are kept while the app is running. Download the CSV regularly; your email keeps a permanent copy.")
+    if view.empty:
+        return
+
+    st.subheader("Order details")
+    oid = st.selectbox("Select order", view["order_id"].tolist())
+    o = get_order(oid)
+    st.text(o["details"])
+    if o["photo"]:
+        st.image(o["photo"], caption="Customer reference image", width=300)
+    if o["design"]:
+        st.image(o["design"], caption="Cake design preview", use_container_width=True)
+    new_status = st.selectbox("Order status", STATUSES, index=STATUSES.index(o["status"]), key=f"st_{oid}")
+    if st.button("Update status"):
+        update_status(oid, new_status)
+        st.success(f"{oid} -> {new_status}")
+    digits = re.sub(r"\D", "", o["phone"])
+    if len(digits) == 10:
+        digits = "91" + digits
+    st.link_button("💬 Message customer on WhatsApp", f"https://wa.me/{digits}")
 
 
 def show_svg(svg):
@@ -236,8 +417,14 @@ def show_svg(svg):
 # ---------------------------------------------------------------
 # 3. USER INPUT
 # ---------------------------------------------------------------
+menu = st.sidebar.radio("Menu", ["🎂 Customer", "🔐 Owner Dashboard"])
+if menu == "🔐 Owner Dashboard":
+    owner_dashboard()
+    st.stop()
+
 st.title("🎂 AI Bakery Recommendation & Cake Design Assistant")
 st.caption("Customise your cake - the preview updates as you choose.")
+st.link_button(f"📸 Follow @{INSTAGRAM_USER} on Instagram", INSTAGRAM_URL)
 
 st.subheader("👤 Customer Details")
 name = st.text_input("Name")
@@ -314,10 +501,12 @@ st.caption(f"{colour} {shape} {flavour} {cake_type} • {weight} kg • {frostin
 st.header("✨ Realistic Cake Image (AI)")
 st.caption("Free AI image - no API key needed. It follows your colour, shape, flavour and toppings. "
            "Text on the cake is shown in the drawing above because AI cannot spell correctly.")
+ai_model = st.selectbox("AI image model", ["flux", "turbo"],
+                        help="Try 'turbo' if 'flux' is slow or fails.")
 if st.button("✨ Generate / Regenerate realistic image"):
     cname = nearest_colour_name(colour)
     p = realistic_prompt(cname, shape, flavour, cake_type, frosting, toppings, theme, occasion)
-    st.session_state["ai_url"] = realistic_url(p, random.randint(1, 99999))
+    st.session_state["ai_url"] = realistic_url(p, random.randint(1, 99999), ai_model)
     st.session_state["ai_prompt"] = p
 if "ai_url" in st.session_state:
     st.image(st.session_state["ai_url"], use_container_width=True,
@@ -362,6 +551,89 @@ if ref_file is not None:
         st.error("This file could not be read as an image. Please upload a JPG or PNG photo.")
     else:
         st.image(ref, width=300)
+
+st.divider()
+st.header("🛒 Place Order")
+st.caption("Check your cake above, fill these details and press Place Order. The bakery gets your order instantly.")
+delivery_type = st.radio("Pickup or Delivery", ["Pickup from bakery", "Home delivery"], horizontal=True)
+address = st.text_area("Delivery address") if delivery_type == "Home delivery" else ""
+today = datetime.now(IST).date()
+need_date = st.date_input("Required date", value=today + timedelta(days=1), min_value=today)
+need_time = st.time_input("Required time", value=dtime(10, 0))
+notes = st.text_input("Extra note for the baker (optional)")
+
+if st.button("✅ Place Order", type="primary"):
+    digits = re.sub(r"\D", "", phone)
+    if not name.strip():
+        st.error("Please enter your Name (in Customer Details at the top).")
+    elif not (10 <= len(digits) <= 13):
+        st.error("Please enter a valid Phone Number (in Customer Details at the top).")
+    elif delivery_type == "Home delivery" and not address.strip():
+        st.error("Please enter the delivery address.")
+    else:
+        order_id = "CK" + datetime.now(IST).strftime("%d%m%H%M%S")
+        colour_label = quick if QUICK[quick] else nearest_colour_name(colour)
+        lines = [
+            f"🎂 NEW CAKE ORDER  #{order_id}",
+            f"Customer: {name.strip()}",
+            f"Phone: {phone.strip()}",
+            f"{delivery_type}" + (f": {address.strip()}" if address.strip() else ""),
+            f"Required: {need_date.strftime('%d %b %Y')} at {need_time.strftime('%I:%M %p')}",
+            "",
+            f"Cake Type: {cake_type}",
+            f"Flavour: {flavour}",
+            f"Weight: {weight} kg (for ~{people} people)",
+            f"Shape: {shape}",
+            f"Colour: {colour_label} ({colour})",
+            f"Frosting: {frosting}",
+            f"Occasion: {occasion}",
+            f"Theme: {theme or '-'}",
+            f"Toppings: {', '.join(toppings) if toppings else '-'}",
+            f"Topper text: {topper or '-'}",
+            f"Message on cake: {message or '-'}",
+            f"Notes: {notes or '-'}",
+            "",
+            f"Estimated Price: Rs.{price}  (budget: Rs.{budget})",
+        ]
+        if "ai_url" in st.session_state:
+            lines += ["", f"AI preview: {st.session_state['ai_url']}"]
+        text = "\n".join(lines)
+
+        photo_bytes = None
+        if ref_file is not None:
+            ref_img = load_reference(ref_file)
+            if ref_img is not None:
+                buf = BytesIO()
+                ref_img.save(buf, format="JPEG", quality=85)
+                photo_bytes = buf.getvalue()
+
+        with st.spinner("Placing your order..."):
+            saved, db_err = save_order({
+                "order_id": order_id, "created": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+                "name": name.strip(), "phone": phone.strip(), "delivery": delivery_type,
+                "need": f"{need_date.strftime('%d %b %Y')} {need_time.strftime('%I:%M %p')}",
+                "cake_type": cake_type, "flavour": flavour, "weight": float(weight), "price": int(price),
+                "details": text, "photo": photo_bytes, "design": svg,
+            })
+            subject = f"New Cake Order #{order_id} - {name.strip()} - Rs.{price}"
+            email_owner(subject, text, photo_bytes, svg, order_id)
+            notify_owner(text, photo_bytes, svg, order_id)
+        if saved:
+            st.success(f"🎉 Order placed! Your Order ID is **{order_id}**. The bakery will contact you on {phone.strip()}.")
+            st.balloons()
+            st.link_button(f"📸 Follow @{INSTAGRAM_USER} on Instagram", INSTAGRAM_URL, key="ig_after_order")
+        else:
+            st.error("Sorry, we could not save your order. Please send it on WhatsApp using the button below.")
+            st.caption(db_err)
+        owner_wa = get_secret("OWNER_WHATSAPP")
+        if owner_wa:
+            st.link_button("📲 Also send order on WhatsApp",
+                           f"https://wa.me/{owner_wa}?text=" + urllib.parse.quote(text))
+        with st.expander("Your order summary"):
+            st.text(text)
+
+st.divider()
+st.markdown(f"🎂 **Femmora Bakes** • [Instagram @{INSTAGRAM_USER}]({INSTAGRAM_URL})")
 
 with st.expander("📝 Photo names checklist (35 flavours, 35 types, shapes)"):
     st.download_button("Download checklist (CSV)", photo_checklist_csv(), "photo_checklist.csv", "text/csv")
