@@ -1,3 +1,6 @@
 streamlit
 pandas
 scikit-learn
+requests
+Pillow
+huggingface_hub
