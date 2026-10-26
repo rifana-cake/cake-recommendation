@@ -493,7 +493,7 @@ cake_type = st.selectbox("Cake Type (10 types)", list(CAKE_TYPES.keys()))
 flavour = st.selectbox("Cake Flavour (35 flavours)", list(FLAVOURS.keys()))
 people = st.number_input("Number of People", min_value=1, max_value=1000, value=10)
 suggested = suggest_weight(people)
-SIZES = {"Auto (based on people)": None, "½ kg (500 g)": 0.5, "1 kg": 1.0, "1½ kg": 1.5,
+SIZES = {"Auto (based on people)": None, "¼ kg (250 g)": 0.25, "½ kg (500 g)": 0.5, "1 kg": 1.0, "1½ kg": 1.5,
          "2 kg": 2.0, "3 kg": 3.0, "4 kg": 4.0, "5 kg": 5.0, "Custom weight": "custom"}
 size_choice = st.selectbox("Cake Size / Weight", list(SIZES.keys()))
 if SIZES[size_choice] == "custom":
