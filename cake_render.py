@@ -1,42 +1,19 @@
-"""Colour-preview cake drawing (SVG) used by app.py.
-
-render_cake_svg(...) returns an SVG string. It follows the chosen colour, shape,
-cake type, weight, toppings, topper text and message.
-"""
+"""Draws a customised cake as SVG using the customer's choices.
+No AI image API needed - colour, shape, toppings and text are drawn directly."""
+import html
 import math
 import random
-import zlib
-from xml.sax.saxutils import escape
 
-W, H = 640, 580
-CX = 320
-BASE_Y = 455
-DRIP = "#4a2c1a"
-
-DEFS = (
-    '<defs>'
-    '<linearGradient id="shine" x1="0" x2="1" y1="0" y2="0">'
-    '<stop offset="0" stop-color="#000" stop-opacity="0.20"/>'
-    '<stop offset="0.35" stop-color="#fff" stop-opacity="0.20"/>'
-    '<stop offset="1" stop-color="#000" stop-opacity="0.24"/>'
-    '</linearGradient>'
-    '<linearGradient id="bg" x1="0" x2="0" y1="0" y2="1">'
-    '<stop offset="0" stop-color="#fff5f8"/><stop offset="1" stop-color="#ffe9ef"/>'
-    '</linearGradient>'
-    '</defs>'
-)
-
-
-# ---------------- colour helpers ----------------
+# ---------------------------------------------------------------- colours
 def _rgb(h):
     h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
 def _hex(r, g, b):
-    def c(v):
-        return max(0, min(255, int(round(v))))
-    return "#%02x%02x%02x" % (c(r), c(g), c(b))
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in (r, g, b))
 
 
 def shade(h, f):
@@ -47,401 +24,333 @@ def shade(h, f):
     return _hex(r * (1 + f), g * (1 + f), b * (1 + f))
 
 
-def text_on(h):
+def is_dark(h):
     r, g, b = _rgb(h)
-    return "#2b2b2b" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#ffffff"
+    return 0.299 * r + 0.587 * g + 0.114 * b < 140
 
 
-def _valid_hex(h):
-    try:
-        h = str(h).lstrip("#")
-        return len(h) == 6 and int(h, 16) >= 0
-    except Exception:
-        return False
+def _grad(uid, col):
+    return (
+        f'<linearGradient id="{uid}" x1="0" x2="1" y1="0" y2="0">'
+        f'<stop offset="0" stop-color="{shade(col, 0.10)}"/>'
+        f'<stop offset="0.45" stop-color="{col}"/>'
+        f'<stop offset="1" stop-color="{shade(col, -0.22)}"/></linearGradient>'
+    )
 
 
-# ---------------- toppings ----------------
-def _topping(name, x, y, rnd):
-    if name == "Fresh Fruits":
-        c = rnd.choice(["#e63946", "#ff9f1c", "#7b2cbf"])
-        return (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" fill="{c}"/>'
-                f'<circle cx="{x-2:.1f}" cy="{y-2:.1f}" r="2" fill="#fff" opacity=".5"/>')
-    if name == "Chocolate Chips":
-        return f'<ellipse cx="{x:.1f}" cy="{y:.1f}" rx="4.5" ry="3" fill="#3e2415"/>'
-    if name == "Sprinkles":
-        c = rnd.choice(["#ff4d6d", "#ffd166", "#06d6a0", "#4cc9f0", "#9b5de5"])
-        a = rnd.randint(0, 179)
-        return (f'<rect x="{x-5:.1f}" y="{y-1.5:.1f}" width="10" height="3" rx="1.5" fill="{c}" '
-                f'transform="rotate({a} {x:.1f} {y:.1f})"/>')
-    if name == "Oreo":
-        return (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="8" fill="#2a2a2a"/>'
-                f'<rect x="{x-6:.1f}" y="{y-1:.1f}" width="12" height="2" fill="#f1f1f1"/>')
-    if name == "Kitkat / Gems":
-        c = rnd.choice(["#ef476f", "#ffd166", "#06d6a0", "#118ab2", "#9b5de5"])
-        return (f'<polygon points="{x:.1f},{y-6:.1f} {x+6:.1f},{y:.1f} {x:.1f},{y+6:.1f} {x-6:.1f},{y:.1f}" '
-                f'fill="{c}" stroke="#fff" stroke-width="1" opacity=".95"/>')
-    if name == "Edible Flowers":
-        out = []
-        for k in range(5):
-            px = x + 7 * math.cos(k * 1.2566)
-            py = y + 7 * math.sin(k * 1.2566)
-            out.append(f'<ellipse cx="{px:.1f}" cy="{py:.1f}" rx="5" ry="3.5" fill="#ff8fab" '
-                       f'transform="rotate({k * 72} {px:.1f} {py:.1f})"/>')
-        out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" fill="#ffd166"/>')
-        return "".join(out)
-    if name == "Cherries":
-        return (f'<path d="M{x:.1f},{y-6:.1f} q5,-10 10,-12" stroke="#2d6a4f" stroke-width="2" fill="none"/>'
-                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7.5" fill="#b5172f"/>'
-                f'<circle cx="{x-2.5:.1f}" cy="{y-2.5:.1f}" r="2" fill="#fff" opacity=".55"/>')
-    if name == "Nuts":
-        return f'<ellipse cx="{x:.1f}" cy="{y:.1f}" rx="6" ry="4" fill="#b98350" stroke="#8a5a2b" stroke-width="1"/>'
-    if name == "Macarons":
-        c = rnd.choice(["#ffb3c6", "#b8e0d2", "#cdb4db", "#ffe5a0"])
-        return (f'<ellipse cx="{x:.1f}" cy="{y-2.5:.1f}" rx="8" ry="3.5" fill="{c}"/>'
-                f'<rect x="{x-7:.1f}" y="{y-1.5:.1f}" width="14" height="2.5" fill="#fff8e7"/>'
-                f'<ellipse cx="{x:.1f}" cy="{y+2.5:.1f}" rx="8" ry="3.5" fill="{c}"/>')
-    if name == "Pearls":
-        return (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4.5" fill="#fdfdfd" stroke="#cfcfcf" stroke-width="1"/>'
-                f'<circle cx="{x-1.5:.1f}" cy="{y-1.5:.1f}" r="1.2" fill="#fff"/>')
-    if name == "Gold Foil":
-        pts = " ".join(f"{x + dx:.1f},{y + dy:.1f}" for dx, dy in [(-6, -2), (-1, -6), (6, -3), (4, 4), (-4, 5)])
-        return f'<polygon points="{pts}" fill="#d4af37" stroke="#b8901f" stroke-width="1"/>'
-    if name == "Rose Petals":
-        a = rnd.randint(0, 179)
-        return (f'<ellipse cx="{x:.1f}" cy="{y:.1f}" rx="8" ry="4.5" fill="#d6336c" opacity=".92" '
-                f'transform="rotate({a} {x:.1f} {y:.1f})"/>')
-    if name == "Marshmallows":
-        return f'<rect x="{x-6:.1f}" y="{y-5:.1f}" width="12" height="10" rx="4" fill="#fff7fb" stroke="#f1d5e0" stroke-width="1"/>'
-    if name == "Biscuit Crumbs":
-        return (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.2" fill="#c8964f"/>'
-                f'<circle cx="{x+4:.1f}" cy="{y+2:.1f}" r="1.6" fill="#a8742f"/>'
-                f'<circle cx="{x-3:.1f}" cy="{y+3:.1f}" r="1.4" fill="#d9ad6a"/>')
-    return f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#ffd166"/>'
+# ---------------------------------------------------------------- toppings
+COUNTS = {"Sprinkles": 28, "Chocolate Chips": 16, "Cherries": 4, "Fresh Fruits": 8,
+          "Oreo": 4, "Kitkat / Gems": 10, "Edible Flowers": 4, "Nuts": 10,
+          "Macarons": 4, "Pearls": 16, "Gold Foil": 10, "Rose Petals": 8,
+          "Marshmallows": 6, "Biscuit Crumbs": 14}
+GEM_COLOURS = ["#ff4d6d", "#ffd166", "#06d6a0", "#4cc9f0", "#b5179e"]
 
 
-def _scatter(anchor, names, rnd, count):
-    """Return svg for toppings spread on a top surface (ellipse anchor)."""
-    cx, cy, rx, ry = anchor
-    items = []
-    for name in names:
-        for _ in range(count):
-            ang = rnd.uniform(0, 2 * math.pi)
-            r = rnd.uniform(0.1, 0.85)
-            x = cx + rx * 0.85 * r * math.cos(ang)
-            y = cy + ry * 0.85 * r * math.sin(ang) - 2
-            items.append((y, _topping(name, x, y, rnd)))
-    items.sort(key=lambda t: t[0])
-    return "".join(s for _, s in items)
+def _item(kind, k, rnd):
+    if kind == "Sprinkles":
+        c = rnd.choice(GEM_COLOURS + ["#ffffff"])
+        a = rnd.randint(0, 180)
+        return f'<rect x="-5" y="-1.5" width="10" height="3" rx="1.5" fill="{c}" transform="rotate({a})"/>'
+    if kind == "Chocolate Chips":
+        return '<path d="M-4 3L0 -5L4 3Z" fill="#3b2012"/>'
+    if kind == "Cherries":
+        return ('<path d="M0 -6Q4 -18 12 -20" stroke="#3f7d20" stroke-width="2" fill="none"/>'
+                '<circle r="8" fill="#c1121f"/><circle cx="-2.5" cy="-3" r="2.2" fill="#fff" opacity=".6"/>')
+    if kind == "Fresh Fruits":
+        if k % 2 == 0:
+            return ('<ellipse rx="8" ry="9" fill="#e5383b"/><path d="M-6 -6L0 -10L6 -6L0 -4Z" fill="#2d6a4f"/>'
+                    '<circle cx="-3" cy="1" r="1" fill="#ffd6d6"/><circle cx="3" cy="3" r="1" fill="#ffd6d6"/>')
+        return '<circle r="6" fill="#3a4fa3"/><circle cx="-2" cy="-2" r="1.8" fill="#fff" opacity=".5"/>'
+    if kind == "Oreo":
+        return ('<circle r="9" fill="#2b2b2b"/><circle r="5" fill="#3f3f3f"/>'
+                '<path d="M-4 0H4M0 -4V4" stroke="#bbb" stroke-width="1"/>')
+    if kind == "Kitkat / Gems":
+        c = rnd.choice(GEM_COLOURS)
+        return f'<circle r="5" fill="{c}"/><circle cx="-1.5" cy="-1.5" r="1.5" fill="#fff" opacity=".7"/>'
+    if kind == "Edible Flowers":
+        petals = "".join(
+            f'<ellipse cx="0" cy="-6" rx="3.5" ry="6" fill="#ffb3c6" transform="rotate({a})"/>'
+            for a in range(0, 360, 72))
+        return petals + '<circle r="3" fill="#ffd166"/>'
+    if kind == "Macarons":
+        c = rnd.choice(["#f4a6c0", "#b8e0d2", "#ffd6a5", "#cdb4db"])
+        return (f'<ellipse rx="9" ry="6" fill="{c}"/><rect x="-9" y="-1.5" width="18" height="3" fill="#fff"/>')
+    if kind == "Pearls":
+        return '<circle r="4" fill="#fffdf7" stroke="#e3dccc" stroke-width="1"/><circle cx="-1.2" cy="-1.2" r="1.2" fill="#fff"/>'
+    if kind == "Gold Foil":
+        return '<path d="M-5 -2L1 -5L5 0L-1 4Z" fill="#d4af37"/>'
+    if kind == "Rose Petals":
+        a = rnd.randint(0, 180)
+        return f'<ellipse rx="7" ry="4" fill="#e63950" transform="rotate({a})"/>'
+    if kind == "Marshmallows":
+        return '<rect x="-6" y="-5" width="12" height="10" rx="3" fill="#fff5f7" stroke="#f3c6d3"/>'
+    if kind == "Biscuit Crumbs":
+        return '<path d="M-4 2L-2 -4L3 -3L4 2Z" fill="#c8924f"/>'
+    if kind == "Nuts":
+        a = rnd.randint(0, 180)
+        return f'<ellipse rx="6" ry="4" fill="#b5835a" transform="rotate({a})"/>'
+    return ""
 
 
-# ---------------- cake parts ----------------
-def _drips(cx, top, rx, ry, rnd):
-    o = [f'<path d="M{cx-rx:.1f},{top:.1f} A{rx:.1f},{ry:.1f} 0 0 0 {cx+rx:.1f},{top:.1f}" '
-         f'stroke="{DRIP}" stroke-width="10" fill="none"/>']
-    n = max(6, int(rx / 14))
-    for i in range(n):
-        x = cx - rx * 0.92 + (rx * 1.84) * (i + 0.5) / n
-        edge = top + ry * math.sqrt(max(0.0, 1 - ((x - cx) / rx) ** 2))
-        length = rnd.randint(14, 46)
-        o.append(f'<path d="M{x-6:.1f},{edge-4:.1f} L{x-6:.1f},{edge+length:.1f} '
-                 f'A6,6 0 0 0 {x+6:.1f},{edge+length:.1f} L{x+6:.1f},{edge-4:.1f} Z" fill="{DRIP}"/>')
-    return "".join(o)
-
-
-def _round_tier(cx, bottom, w, h, col, rnd, crust=False, pearls=False, drip=False):
-    rx = w / 2
-    ry = max(10.0, rx * 0.2)
-    top = bottom - h
-    body = (f"M{cx-rx:.1f},{top:.1f} L{cx-rx:.1f},{bottom:.1f} "
-            f"A{rx:.1f},{ry:.1f} 0 0 0 {cx+rx:.1f},{bottom:.1f} L{cx+rx:.1f},{top:.1f} Z")
-    o = [f'<path d="{body}" fill="{shade(col, -0.06)}"/>']
-    if crust:
-        cy = bottom - 24
-        o.append(f'<path d="M{cx-rx:.1f},{cy:.1f} L{cx-rx:.1f},{bottom:.1f} '
-                 f'A{rx:.1f},{ry:.1f} 0 0 0 {cx+rx:.1f},{bottom:.1f} L{cx+rx:.1f},{cy:.1f} '
-                 f'A{rx:.1f},{ry:.1f} 0 0 1 {cx-rx:.1f},{cy:.1f} Z" fill="#c8964f"/>')
-    o.append(f'<path d="{body}" fill="url(#shine)"/>')
-    if drip:
-        o.append(_drips(cx, top, rx, ry, rnd))
-    o.append(f'<ellipse cx="{cx:.1f}" cy="{top:.1f}" rx="{rx:.1f}" ry="{ry:.1f}" '
-             f'fill="{shade(col, 0.22)}" stroke="{shade(col, -0.15)}" stroke-width="1.2"/>')
-    if drip:
-        o.append(f'<ellipse cx="{cx:.1f}" cy="{top:.1f}" rx="{rx*0.8:.1f}" ry="{ry*0.8:.1f}" fill="{DRIP}"/>'
-                 f'<ellipse cx="{cx-rx*0.2:.1f}" cy="{top-ry*0.2:.1f}" rx="{rx*0.3:.1f}" ry="{ry*0.2:.1f}" '
-                 f'fill="#fff" opacity=".18"/>')
-    else:
-        n = max(6, int(rx / 10))
-        r = min(8.0, rx * 0.045)
-        for i in range(n + 1):
-            t = math.pi * i / n
-            o.append(f'<circle cx="{cx + rx*math.cos(t):.1f}" cy="{top + ry*math.sin(t):.1f}" r="{r:.1f}" '
-                     f'fill="{shade(col, 0.38)}" stroke="{shade(col, -0.1)}" stroke-width=".6"/>')
-    if pearls:
-        for i in range(25):
-            t = math.pi * i / 24
-            o.append(f'<circle cx="{cx + rx*math.cos(t):.1f}" cy="{bottom + ry*math.sin(t) - 5:.1f}" r="3.6" '
-                     f'fill="#fff" stroke="#d9d9d9" stroke-width=".8"/>')
-    return "".join(o), (cx, top, rx, ry), (cx, bottom - h / 2, w)
-
-
-def _box_tier(cx, bottom, w, h, col, rnd, crust=False, pearls=False, drip=False):
-    rx = w / 2
-    dy = max(14.0, w * 0.09)
-    dx = w * 0.07
-    top = bottom - h
-    o = [f'<rect x="{cx-rx:.1f}" y="{top:.1f}" width="{w:.1f}" height="{h:.1f}" fill="{shade(col, -0.06)}"/>']
-    if crust:
-        o.append(f'<rect x="{cx-rx:.1f}" y="{bottom-24:.1f}" width="{w:.1f}" height="24" fill="#c8964f"/>')
-    o.append(f'<rect x="{cx-rx:.1f}" y="{top:.1f}" width="{w:.1f}" height="{h:.1f}" fill="url(#shine)"/>')
-    if drip:
-        n = max(6, int(rx / 14))
-        o.append(f'<rect x="{cx-rx:.1f}" y="{top-4:.1f}" width="{w:.1f}" height="10" fill="{DRIP}"/>')
-        for i in range(n):
-            x = cx - rx * 0.94 + (rx * 1.88) * (i + 0.5) / n
-            length = rnd.randint(14, 46)
-            o.append(f'<path d="M{x-6:.1f},{top:.1f} L{x-6:.1f},{top+length:.1f} A6,6 0 0 0 {x+6:.1f},{top+length:.1f} '
-                     f'L{x+6:.1f},{top:.1f} Z" fill="{DRIP}"/>')
-    face = f"{cx-rx:.1f},{top:.1f} {cx+rx:.1f},{top:.1f} {cx+rx-dx:.1f},{top-dy:.1f} {cx-rx+dx:.1f},{top-dy:.1f}"
-    o.append(f'<polygon points="{face}" fill="{shade(col, 0.22)}" stroke="{shade(col, -0.15)}" stroke-width="1.2"/>')
-    if drip:
-        o.append(f'<polygon points="{cx-rx*0.85:.1f},{top-2:.1f} {cx+rx*0.85:.1f},{top-2:.1f} '
-                 f'{cx+rx*0.85-dx:.1f},{top-dy+3:.1f} {cx-rx*0.85+dx:.1f},{top-dy+3:.1f}" fill="{DRIP}"/>')
-    else:
-        x = cx - rx + 8
-        while x <= cx + rx - 8:
-            o.append(f'<circle cx="{x:.1f}" cy="{top:.1f}" r="5.5" fill="{shade(col, 0.38)}" '
-                     f'stroke="{shade(col, -0.1)}" stroke-width=".6"/>')
-            x += 14
-    if pearls:
-        x = cx - rx + 10
-        while x <= cx + rx - 10:
-            o.append(f'<circle cx="{x:.1f}" cy="{bottom-5:.1f}" r="3.6" fill="#fff" stroke="#d9d9d9" stroke-width=".8"/>')
-            x += 14
-    return "".join(o), (cx, top - dy / 2, rx * 0.82, dy / 2), (cx, bottom - h / 2, w)
-
-
-def _heart(cx, bottom, w, col, rnd, drip=False, crust=False):
-    s = w / 34.0
-    k = 0.62
-    thick = 46
-    yc = bottom - thick - 17 * s * k
-
-    def pts(dy):
-        out = []
-        for i in range(61):
-            t = 2 * math.pi * i / 60
-            x = 16 * math.sin(t) ** 3
-            y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
-            out.append(f"{cx + x*s:.1f},{yc - y*s*k + dy:.1f}")
-        return " ".join(out)
-
-    o = []
-    side = shade(col, -0.12)
-    for dy in range(thick, -1, -3):
-        o.append(f'<polygon points="{pts(dy)}" fill="{side}"/>')
-    if crust:
-        for dy in range(thick, thick - 22, -3):
-            o.append(f'<polygon points="{pts(dy)}" fill="#c8964f"/>')
-    o.append(f'<polygon points="{pts(0)}" fill="{shade(col, 0.22)}" stroke="{shade(col, -0.15)}" stroke-width="1.4"/>')
-    if drip:
-        o.append(f'<polygon points="{pts(0)}" fill="{DRIP}" opacity=".85" transform="translate({cx} {yc}) scale(.78) translate({-cx} {-yc})"/>')
-    anchor = (cx, yc - 1 * s * k, 9 * s, 5.5 * s * k * 1.4)
-    return "".join(o), anchor, None
-
-
-def _cupcake(cx, bottom, col, rnd):
-    liner = shade(col, -0.35)
-    o = [f'<polygon points="{cx-36},{bottom-46} {cx+36},{bottom-46} {cx+27},{bottom} {cx-27},{bottom}" fill="{liner}"/>']
-    for i in range(-3, 4):
-        o.append(f'<line x1="{cx+i*9}" y1="{bottom-46}" x2="{cx+i*6.5}" y2="{bottom}" stroke="{shade(liner, 0.25)}" stroke-width="1.6"/>')
-    for (yy, rx, ry, f) in [(46, 40, 13, 0.0), (60, 31, 12, 0.08), (73, 22, 10, 0.16), (84, 11, 8, 0.24)]:
-        o.append(f'<ellipse cx="{cx}" cy="{bottom-yy}" rx="{rx}" ry="{ry}" fill="{shade(col, f)}" '
-                 f'stroke="{shade(col, -0.15)}" stroke-width="1"/>')
-    return "".join(o), (cx, bottom - 88, 13, 5), None
-
-
-def _jar(cx, bottom, col):
-    w, h = 112, 150
-    x = cx - w / 2
-    top = bottom - h
-    cid = f"jar{int(cx)}"
-    cream = "#f5e6c8"
-    bands = [cream, col, cream, col]
-    bh = (h - 16) / len(bands)
-    o = [f'<clipPath id="{cid}"><rect x="{x}" y="{top+8}" width="{w}" height="{h-8}" rx="14"/></clipPath>',
-         f'<g clip-path="url(#{cid})">']
-    for i, b in enumerate(bands):
-        yy = bottom - 8 - (i + 1) * bh
-        o.append(f'<rect x="{x}" y="{yy:.1f}" width="{w}" height="{bh+1:.1f}" fill="{b}"/>')
-    o.append(f'<rect x="{x}" y="{top+8}" width="{w}" height="{h-8}" fill="url(#shine)"/></g>')
-    o.append(f'<rect x="{x}" y="{top+8}" width="{w}" height="{h-8}" rx="14" fill="#cfe8ff" opacity=".18" '
-             f'stroke="#8fa3b5" stroke-width="2.5"/>')
-    o.append(f'<rect x="{x+6}" y="{top+2}" width="{w-12}" height="9" rx="4" fill="#b9c4cf"/>')
-    for (dy, rx, ry, f) in [(2, 40, 12, 0.0), (-12, 28, 10, 0.12)]:
-        o.append(f'<ellipse cx="{cx}" cy="{top+dy}" rx="{rx}" ry="{ry}" fill="{shade(col, f)}" '
-                 f'stroke="{shade(col, -0.15)}" stroke-width="1"/>')
-    return "".join(o), (cx, top - 14, 20, 6), None
-
-
-# ---------------- top decorations ----------------
-def _star(x, y, r, fill="#ffd166"):
+def _toppings(cx, cy, rx, ry, toppings, seed, density=1.0):
+    if not toppings:
+        return ""
+    rnd = random.Random(seed)
+    pool = []
+    for t in toppings:
+        pool += [t] * max(1, round(COUNTS.get(t, 6) * density))
+    rnd.shuffle(pool)
+    n = len(pool)
+    s = max(0.55, min(1.15, rx / 120))
     pts = []
-    for i in range(10):
-        rad = r if i % 2 == 0 else r * 0.45
-        a = -math.pi / 2 + i * math.pi / 5
-        pts.append(f"{x + rad*math.cos(a):.1f},{y + rad*math.sin(a):.1f}")
-    return f'<polygon points="{" ".join(pts)}" fill="{fill}" stroke="#d9a400" stroke-width="1"/>'
+    for i, kind in enumerate(pool):
+        r = math.sqrt((i + 0.5) / n) * 0.82
+        th = i * 2.39996
+        pts.append((cy + ry * r * math.sin(th), kind, cx + rx * r * math.cos(th), i))
+    pts.sort()
+    return "".join(
+        f'<g transform="translate({x:.1f} {y:.1f}) scale({s:.2f})">{_item(kind, i, rnd)}</g>'
+        for y, kind, x, i in pts)
 
 
-def _decor(cake_type, cx, ty):
-    o = []
-    if cake_type == "Birthday Cake":
-        for dx, c in [(-22, "#4cc9f0"), (0, "#ff4d6d"), (22, "#ffd166")]:
-            o.append(f'<rect x="{cx+dx-3.5}" y="{ty-34}" width="7" height="30" rx="2" fill="{c}"/>')
-            o.append(f'<ellipse cx="{cx+dx}" cy="{ty-42}" rx="4" ry="7" fill="#ffb703"/>'
-                     f'<ellipse cx="{cx+dx}" cy="{ty-40}" rx="2" ry="4" fill="#ffe8a3"/>')
-    elif cake_type == "Anniversary Cake":
-        o.append(f'<path d="M{cx},{ty-8} c-18,-14 -14,-32 0,-24 c14,-8 18,10 0,24 z" fill="#e63946" stroke="#b5172f" stroke-width="1"/>')
-    elif cake_type == "Theme Cake":
-        o.append(_star(cx, ty - 22, 13))
-        o.append(_star(cx - 34, ty - 12, 8, "#ff8fab"))
-        o.append(_star(cx + 34, ty - 12, 8, "#9bd1ff"))
-    elif cake_type == "Wedding Cake":
-        o.append(f'<circle cx="{cx-9}" cy="{ty-14}" r="9" fill="none" stroke="#d4af37" stroke-width="3"/>'
-                 f'<circle cx="{cx+9}" cy="{ty-14}" r="9" fill="none" stroke="#e6c76a" stroke-width="3"/>')
-    return "".join(o)
+# ---------------------------------------------------------------- small parts
+def _plate(cx, y, rx):
+    ry = rx * 0.14 + 6
+    return (f'<ellipse cx="{cx}" cy="{y + 14}" rx="{rx + 24:.1f}" ry="{ry + 2:.1f}" fill="#000" opacity=".12"/>'
+            f'<ellipse cx="{cx}" cy="{y + 6}" rx="{rx + 20:.1f}" ry="{ry:.1f}" fill="#d9d2cc"/>'
+            f'<ellipse cx="{cx}" cy="{y + 2}" rx="{rx + 20:.1f}" ry="{ry:.1f}" fill="#f4efea"/>')
 
 
-# ---------------- main ----------------
-def render_cake_svg(colour="#f48fb1", shape="Round", cake_type="Regular Sponge Cake", weight=1.0,
-                    toppings=None, topper="", message="", occasion="", theme=""):
-    col = colour if _valid_hex(colour) else "#f48fb1"
-    toppings = list(toppings or [])
-    topper = (topper or "").strip()
-    message = (message or "").strip()
-    try:
-        wt = max(0.5, min(float(weight), 5.0))
-    except Exception:
-        wt = 1.0
-    rnd = random.Random(zlib.crc32(f"{col}|{shape}|{cake_type}|{','.join(toppings)}".encode()))
+def _plaque(cx, ytop, text):
+    t = html.escape(text.strip()[:30])
+    n = max(len(t), 1)
+    fs = max(14, min(28, int(380 / (n * 0.55))))
+    w = min(440, n * fs * 0.55 + 44)
+    py = ytop - 100
+    s = []
+    for dx in (-w * 0.28, w * 0.28):
+        s.append(f'<line x1="{cx + dx:.1f}" y1="{py + 44}" x2="{cx + dx:.1f}" y2="{ytop}" '
+                 f'stroke="#d4af37" stroke-width="4" stroke-linecap="round"/>')
+    s.append(f'<rect x="{cx - w / 2:.1f}" y="{py}" width="{w:.1f}" height="44" rx="12" '
+             f'fill="#fffdf7" stroke="#d4af37" stroke-width="3"/>')
+    s.append(f'<text x="{cx}" y="{py + 30}" text-anchor="middle" font-family="Georgia, serif" '
+             f'font-style="italic" font-size="{fs}" fill="#7a1f3d">{t}</text>')
+    return "".join(s)
 
-    bw = 250 + wt * 28
-    bh = 100 + wt * 10
-    drip = cake_type == "Drip Cake"
-    crust = cake_type == "Cheesecake"
-    pearls = cake_type == "Wedding Cake"
 
-    parts = [DEFS, f'<rect width="{W}" height="{H}" fill="url(#bg)"/>']
+def _candles(cx, cy, rx):
+    s = []
+    for i, dx in enumerate((-0.5, 0, 0.5)):
+        x = cx + rx * dx
+        y = cy
+        c = ["#ff8fab", "#8ecae6", "#ffd166"][i]
+        s.append(f'<rect x="{x - 4:.1f}" y="{y - 44:.1f}" width="8" height="44" rx="2" fill="{c}"/>')
+        s.append(f'<path d="M{x - 4:.1f} {y - 30:.1f}L{x + 4:.1f} {y - 36:.1f}M{x - 4:.1f} {y - 18:.1f}'
+                 f'L{x + 4:.1f} {y - 24:.1f}" stroke="#fff" stroke-width="2" opacity=".8"/>')
+        s.append(f'<ellipse cx="{x:.1f}" cy="{y - 54:.1f}" rx="5" ry="8" fill="#ffb703"/>'
+                 f'<ellipse cx="{x:.1f}" cy="{y - 52:.1f}" rx="2.5" ry="4.5" fill="#fff3b0"/>')
+    return "".join(s)
 
-    # plate
-    plate_rx = bw * 0.62 + 40
-    plate_ry = bw * 0.5 * 0.2 + 18
-    parts.append(f'<ellipse cx="{CX}" cy="{BASE_Y+6}" rx="{plate_rx:.1f}" ry="{plate_ry:.1f}" fill="#e4e4e4"/>')
-    parts.append(f'<ellipse cx="{CX}" cy="{BASE_Y+2}" rx="{plate_rx:.1f}" ry="{plate_ry:.1f}" fill="#f7f7f7" stroke="#d6d6d6"/>')
 
-    top_anchor = None
-    anchors = []
-    front = None
-    top_center_y = BASE_Y
-    cake_svg = []
+def _body_text(cx, y, msg, bg, maxw, maxfs=22):
+    t = html.escape(msg.strip()[:36])
+    if not t:
+        return ""
+    fs = max(11, min(maxfs, int(maxw / (len(t) * 0.55))))
+    fill = "#ffffff" if is_dark(bg) else "#5a1a2b"
+    return (f'<text x="{cx:.1f}" y="{y:.1f}" text-anchor="middle" font-family="Georgia, serif" '
+            f'font-style="italic" font-size="{fs}" fill="{fill}">{t}</text>')
+
+
+def _theme_kind(theme):
+    t = theme.lower()
+    if any(k in t for k in ("flor", "flower", "rose", "garden")):
+        return "flower"
+    if any(k in t for k in ("heart", "love", "valentine", "romantic")):
+        return "heart"
+    if any(k in t for k in ("star", "space", "galaxy", "night", "frozen")):
+        return "star"
+    return None
+
+
+def _deco(kind, cx, y, w):
+    s = []
+    for dx in (-0.36, -0.18, 0, 0.18, 0.36):
+        x = cx + w * dx
+        if kind == "flower":
+            g = "".join(f'<ellipse cx="0" cy="-6" rx="3.2" ry="5.5" fill="#ff8fab" transform="rotate({a})"/>'
+                        for a in range(0, 360, 72)) + '<circle r="2.8" fill="#ffd166"/>'
+        elif kind == "heart":
+            g = '<path d="M0 5C-10 -2 -6 -9 0 -4C6 -9 10 -2 0 5Z" fill="#ff4d6d"/>'
+        else:
+            g = '<polygon points="0,-7 2,-2 7,-2 3,1.5 4.5,6.5 0,3.5 -4.5,6.5 -3,1.5 -7,-2 -2,-2" fill="#ffd166"/>'
+        s.append(f'<g transform="translate({x:.1f} {y:.1f})">{g}</g>')
+    return "".join(s)
+
+
+# ---------------------------------------------------------------- tiers
+def _round_tier(out, defs, cx, base, w, h, col, uid, drip):
+    rx = w / 2
+    ry = max(10, w * 0.11)
+    x0, x1, top = cx - rx, cx + rx, base - h
+    defs.append(_grad(uid, col))
+    dc = "#4b2a1b" if not is_dark(col) else "#fff4f4"
+    if drip:
+        rnd = random.Random(int(w))
+        n = max(4, int(w / 34))
+        for i in range(n):
+            x = x0 + 18 + (w - 36) * i / (n - 1)
+            t = (x - cx) / rx
+            ln = ry * math.sqrt(max(0, 1 - t * t)) + 16 + rnd.random() * h * 0.35
+            out.append(f'<rect x="{x - 7:.1f}" y="{top}" width="14" height="{ln:.1f}" rx="7" fill="{dc}"/>')
+    out.append(f'<path d="M{x0:.1f} {top:.1f}L{x0:.1f} {base:.1f}A{rx:.1f} {ry:.1f} 0 0 0 {x1:.1f} {base:.1f}'
+               f'L{x1:.1f} {top:.1f}Z" fill="url(#{uid})"/>')
+    if drip:  # redraw drips on top of the body
+        rnd = random.Random(int(w))
+        n = max(4, int(w / 34))
+        for i in range(n):
+            x = x0 + 18 + (w - 36) * i / (n - 1)
+            t = (x - cx) / rx
+            ln = ry * math.sqrt(max(0, 1 - t * t)) + 16 + rnd.random() * h * 0.35
+            out.append(f'<rect x="{x - 7:.1f}" y="{top}" width="14" height="{ln:.1f}" rx="7" fill="{dc}"/>')
+    else:
+        mid = base - h * 0.5
+        out.append(f'<path d="M{x0:.1f} {mid:.1f}A{rx:.1f} {ry:.1f} 0 0 0 {x1:.1f} {mid:.1f}" fill="none" '
+                   f'stroke="{shade(col, 0.55)}" stroke-width="7" opacity=".8"/>')
+    tc = dc if drip else shade(col, 0.18)
+    out.append(f'<ellipse cx="{cx}" cy="{top:.1f}" rx="{rx:.1f}" ry="{ry:.1f}" fill="{tc}"/>')
+    out.append(f'<ellipse cx="{cx}" cy="{top:.1f}" rx="{rx * 0.88:.1f}" ry="{ry * 0.86:.1f}" fill="none" '
+               f'stroke="{shade(tc, 0.3)}" stroke-width="2" opacity=".7"/>')
+    n = max(8, int(w / 14))
+    for i in range(n + 1):
+        a = math.pi * i / n
+        out.append(f'<circle cx="{cx + rx * math.cos(a):.1f}" cy="{top + ry * math.sin(a):.1f}" r="5" '
+                   f'fill="{shade(col, 0.38)}"/>')
+        out.append(f'<circle cx="{cx + rx * math.cos(a):.1f}" cy="{base + ry * math.sin(a):.1f}" r="5" '
+                   f'fill="{shade(col, 0.2)}"/>')
+    return (cx, top, rx * 0.9, ry * 0.75)
+
+
+def _box_tier(out, defs, cx, base, w, h, col, uid):
+    d = w * 0.3
+    x0 = cx - (w + d) / 2
+    x1 = x0 + w
+    top = base - h
+    k = d * 0.5
+    defs.append(_grad(uid, col))
+    out.append(f'<polygon points="{x1:.1f},{top:.1f} {x1 + d:.1f},{top - k:.1f} {x1 + d:.1f},{base - k:.1f} '
+               f'{x1:.1f},{base:.1f}" fill="{shade(col, -0.28)}"/>')
+    out.append(f'<rect x="{x0:.1f}" y="{top:.1f}" width="{w:.1f}" height="{h:.1f}" fill="url(#{uid})"/>')
+    out.append(f'<rect x="{x0:.1f}" y="{base - h * 0.5:.1f}" width="{w:.1f}" height="7" '
+               f'fill="{shade(col, 0.55)}" opacity=".8"/>')
+    out.append(f'<polygon points="{x0:.1f},{top:.1f} {x1:.1f},{top:.1f} {x1 + d:.1f},{top - k:.1f} '
+               f'{x0 + d:.1f},{top - k:.1f}" fill="{shade(col, 0.2)}"/>')
+    x = x0 + 8
+    while x < x1:
+        out.append(f'<circle cx="{x:.1f}" cy="{top + 2:.1f}" r="5" fill="{shade(col, 0.38)}"/>')
+        out.append(f'<circle cx="{x:.1f}" cy="{base - 2:.1f}" r="5" fill="{shade(col, 0.2)}"/>')
+        x += 14
+    return ((x0 + x1 + d) / 2, top - k / 2, w * 0.38, k * 0.36), (x0 + x1) / 2, w
+
+
+# ---------------------------------------------------------------- scenes
+def _cupcakes(out, defs, col, toppings, topper, message):
+    base = 470
+    out.append(_plate(300, base, 270))
+    for i, x in enumerate((165, 300, 435)):
+        defs.append(_grad(f"cg{i}", col))
+        out.append(f'<path d="M{x - 50} {base - 62}L{x + 50} {base - 62}L{x + 38} {base}L{x - 38} {base}Z" fill="#f1c58b"/>')
+        for dx in range(-40, 41, 16):
+            out.append(f'<line x1="{x + dx * 0.9:.1f}" y1="{base - 62}" x2="{x + dx * 0.72:.1f}" y2="{base}" '
+                       f'stroke="#e0a96a" stroke-width="3"/>')
+        for rx_, ry_, yy in ((54, 18, base - 62), (42, 15, base - 82), (30, 12, base - 100), (16, 9, base - 116)):
+            out.append(f'<ellipse cx="{x}" cy="{yy}" rx="{rx_}" ry="{ry_}" fill="url(#cg{i})" '
+                       f'stroke="{shade(col, -0.15)}" stroke-width="1"/>')
+        out.append(_toppings(x, base - 98, 36, 16, toppings, 10 + i, density=0.3))
+    if topper.strip():
+        out.append(_plaque(300, base - 125, topper))
+    if message.strip():
+        out.append(_body_text(300, 565, message, "#fde4ea", 480))
+
+
+def _heart(out, defs, col, weight, toppings, topper, message):
+    s = 1.3 + min(max(weight, 0.5), 5) * 0.06
+    path = "M0 110C-160 0 -120 -120 0 -50C120 -120 160 0 0 110Z"
+    out.append('<ellipse cx="300" cy="300" rx="270" ry="215" fill="#d9d2cc"/>'
+               '<ellipse cx="300" cy="296" rx="270" ry="215" fill="#f4efea"/>')
+    g = [f'<g transform="translate(300 250) scale({s:.2f})">']
+    for i in range(22, 0, -2):
+        g.append(f'<path d="{path}" transform="translate(0 {i})" fill="{shade(col, -0.3)}"/>')
+    g.append(f'<path d="{path}" fill="{shade(col, 0.12)}"/>')
+    g.append(f'<path d="{path}" transform="translate(0 2) scale(.9)" fill="none" stroke="{shade(col, 0.5)}" '
+             f'stroke-width="5" stroke-dasharray="0.1 11" stroke-linecap="round"/>')
+    g.append("</g>")
+    out.append("".join(g))
+    out.append(_toppings(300, 212, 78 * s / 1.6, 32, toppings, 3))
+    top_col = shade(col, 0.12)
+    if topper.strip():
+        t = html.escape(topper.strip()[:30])
+        fs = max(14, min(30, int(190 / (len(t) * 0.55))))
+        fill = "#ffffff" if is_dark(top_col) else "#7a1f3d"
+        out.append(f'<text x="300" y="{250 + 32 * s:.1f}" text-anchor="middle" font-family="Georgia, serif" '
+                   f'font-style="italic" font-weight="bold" font-size="{fs}" fill="{fill}">{t}</text>')
+    if message.strip():
+        out.append(_body_text(300, 250 + 56 * s, message, top_col, 160, 18))
+
+
+def render_cake_svg(colour="#f48fb1", shape="Round", cake_type="Regular Sponge", weight=1.0,
+                    toppings=(), topper="", message="", occasion="Birthday", theme=""):
+    W, H = 600, 620
+    defs, out = [], []
+    defs.append('<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff8f1"/>'
+                '<stop offset="1" stop-color="#fde4ea"/></linearGradient>')
+    out.append(f'<rect width="{W}" height="{H}" fill="url(#bg)"/>')
+    toppings = list(toppings)
 
     if cake_type == "Cupcakes":
-        for dx in (-125, 0, 125):
-            s, a, _ = _cupcake(CX + dx, BASE_Y - 10, col, rnd)
-            cake_svg.append(s)
-            anchors.append(a)
-        top_center_y = BASE_Y - 10 - 88
-    elif cake_type == "Jar Cake":
-        for dx in (-130, 0, 130):
-            s, a, _ = _jar(CX + dx, BASE_Y - 6, col)
-            cake_svg.append(s)
-            anchors.append(a)
-        top_center_y = BASE_Y - 6 - 150
+        _cupcakes(out, defs, colour, toppings, topper, message)
     elif shape == "Heart":
-        s, a, _ = _heart(CX, BASE_Y, bw * 0.95, col, rnd, drip=drip, crust=crust)
-        cake_svg.append(s)
-        anchors.append(a)
-        top_center_y = a[1]
+        _heart(out, defs, colour, weight, toppings, topper, message)
     else:
-        tiers = {"2 Tier": 2, "3 Tier": 3}.get(shape, 1)
-        if cake_type == "Wedding Cake" and tiers == 1:
-            tiers = 2
-        if tiers > 1:
-            widths = [1.0, 0.68, 0.46][:tiers]
-            hh = bh * (0.62 if tiers == 2 else 0.5)
-            bottom = BASE_Y
-            for i, f in enumerate(widths):
-                s, a, fr = _round_tier(CX, bottom, bw * f, hh, col, rnd,
-                                       crust=crust and i == 0, pearls=pearls, drip=drip)
-                cake_svg.append(s)
+        wt = min(max(weight, 0.5), 6)
+        n_tiers = {"2 Tier": 2, "3 Tier": 3}.get(shape, 1)
+        boxy = shape in ("Square", "Rectangle")
+        base_w = 230 + wt * 28
+        if shape == "Square":
+            base_w = min(base_w, 320)
+        if shape == "Rectangle":
+            base_w = min(base_w * 1.2, 380)
+        th = 105 + min(wt, 5) * 4 if n_tiers == 1 else (88 if n_tiers == 2 else 78)
+        base_y = 470
+        drip = ("Drip" in cake_type) or ("Mirror" in cake_type)
+        rx_plate = (base_w * 1.15 if boxy else base_w) / 2
+        out.append(_plate(300, base_y, rx_plate))
+        cur, w = base_y, base_w
+        geom = None
+        bottom = None
+        for i in range(n_tiers):
+            if boxy:
+                geom, cx_mid, bw = _box_tier(out, defs, 300, cur, w, th, colour, f"g{i}")
                 if i == 0:
-                    front = fr
-                top_anchor = a
-                bottom -= hh
-            anchors.append(top_anchor)
-            top_center_y = top_anchor[1]
-        elif shape == "Square":
-            s, a, front = _box_tier(CX, BASE_Y, bw * 0.85, bh, col, rnd, crust, pearls, drip)
-            cake_svg.append(s)
-            anchors.append(a)
-            top_center_y = a[1]
-        elif shape == "Rectangle":
-            s, a, front = _box_tier(CX, BASE_Y, bw * 1.15, bh * 0.8, col, rnd, crust, pearls, drip)
-            cake_svg.append(s)
-            anchors.append(a)
-            top_center_y = a[1]
-        else:
-            s, a, front = _round_tier(CX, BASE_Y, bw, bh, col, rnd, crust, pearls, drip)
-            cake_svg.append(s)
-            anchors.append(a)
-            top_center_y = a[1]
-
-    # topper stick (drawn behind the cake top decorations)
-    if topper:
-        parts.append(f'<line x1="{CX}" y1="{top_center_y-6:.1f}" x2="{CX}" y2="68" stroke="#c9a227" stroke-width="3"/>')
-    parts.extend(cake_svg)
-
-    # toppings
-    if toppings and anchors:
-        per = 6 if len(anchors) == 1 else 2
-        for a in anchors:
-            parts.append(_scatter(a, toppings, rnd, per))
-
-    # top decoration (candles, heart, stars, rings)
-    if cake_type in ("Birthday Cake", "Anniversary Cake", "Theme Cake", "Wedding Cake") and anchors:
-        a = anchors[0] if len(anchors) == 1 else anchors[0]
-        parts.append(_decor(cake_type, a[0], a[1]))
-
-    # topper banner
-    if topper:
-        txt = topper[:34]
-        bw_banner = min(580, 40 + len(txt) * 15)
-        parts.append(f'<rect x="{CX-bw_banner/2:.1f}" y="22" width="{bw_banner:.1f}" height="46" rx="23" '
-                     f'fill="#fff" stroke="#c9a227" stroke-width="2.5"/>')
-        fs = 22 if len(txt) <= 22 else 17
-        parts.append(f'<text x="{CX}" y="52" text-anchor="middle" font-family="Georgia, serif" font-weight="bold" '
-                     f'font-size="{fs}" fill="#4a3b1c">{escape(txt)}</text>')
-
-    # message written on the cake front
-    foot_msg = ""
-    if message:
-        if front:
-            fx, fy, fw = front
-            txt = message[:34]
-            fs = max(11, min(22, (fw * 0.85) / (max(len(txt), 1) * 0.55)))
-            parts.append(f'<text x="{fx:.1f}" y="{fy+6:.1f}" text-anchor="middle" font-family="Georgia, serif" '
-                         f'font-style="italic" font-size="{fs:.0f}" fill="{text_on(col)}">{escape(txt)}</text>')
-        else:
-            foot_msg = f'Message: {message[:40]}'
-
-    # footer captions
-    l1 = f"{cake_type} - {shape}"
-    l2 = " - ".join(x for x in [occasion, theme.strip() if theme else "", foot_msg] if x)
-    parts.append(f'<text x="{CX}" y="548" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" '
-                 f'fill="#6b5560">{escape(l1)}</text>')
-    if l2:
-        parts.append(f'<text x="{CX}" y="568" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" '
-                     f'fill="#8a7580">{escape(l2[:70])}</text>')
+                    bottom = (cx_mid, w)
+            else:
+                geom = _round_tier(out, defs, 300, cur, w, th, colour, f"g{i}", drip)
+                if i == 0:
+                    bottom = (300, w)
+            cur -= th
+            w *= 0.72
+        cx, cy, rx, ry = geom
+        out.append(_toppings(cx, cy, rx, ry, toppings, 7))
+        if topper.strip():
+            out.append(_plaque(cx, cy, topper))
+        elif occasion == "Birthday":
+            out.append(_candles(cx, cy, rx))
+        bx, bw = bottom
+        kind = _theme_kind(theme)
+        if kind:
+            out.append(_deco(kind, bx, base_y - th + max(10, bw * 0.11) + 14, bw * 0.8))
+        if message.strip():
+            out.append(_body_text(bx, base_y - th * 0.2, message, colour, bw * 0.8))
 
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">'
-            + "".join(parts) + "</svg>")
+            f'<defs>{"".join(defs)}</defs>{"".join(out)}</svg>')
