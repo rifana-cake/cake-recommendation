@@ -2,4 +2,3 @@ streamlit
 pandas
 scikit-learn
 requests
-huggingface_hub

@@ -171,6 +171,69 @@ def find_photos(flavour, cake_type, shape, limit=6):
     return [p for _, p in scored[:limit]]
 
 
+CATALOG_CSV = Path(__file__).parent / "cake_dataset.csv"
+
+
+def _find_file(name):
+    """Find a photo in cake_photos/ ignoring hyphens, spaces, upper/lower case and extension."""
+    if not PHOTO_DIR.exists():
+        return None
+    want = compact(Path(str(name)).stem)
+    for p in PHOTO_DIR.iterdir():
+        if p.suffix.lower() in PHOTO_EXT and compact(p.stem) == want:
+            return p
+    return None
+
+
+@st.cache_data
+def load_catalog(csv_mtime):
+    """Read cake_dataset.csv (image, flavour, cake_type, shape, colour, toppings). Rows whose photo is
+    missing are skipped, so you can add photos step by step."""
+    if not CATALOG_CSV.exists():
+        return []
+    df = pd.read_csv(CATALOG_CSV, dtype=str).fillna("")
+    df.columns = [c.strip().lower() for c in df.columns]
+    rows = []
+    for _, r in df.iterrows():
+        p = _find_file(r.get("image", ""))
+        if p is None:
+            continue
+        rows.append({
+            "path": str(p),
+            "flavour": r.get("flavour", "").strip(),
+            "cake_type": r.get("cake_type", "").strip(),
+            "shape": r.get("shape", "").strip(),
+            "colour": r.get("colour", "").strip(),
+            "toppings": {compact(t) for t in re.split(r"[;,]", r.get("toppings", "")) if t.strip()},
+        })
+    return rows
+
+
+def catalog_matches(flavour, cake_type, shape, colour_name, toppings, top_n=3):
+    """Content-based retrieval: score every catalog photo against the customer's choices."""
+    rows = load_catalog(CATALOG_CSV.stat().st_mtime if CATALOG_CSV.exists() else 0)
+    want_top = {compact(t) for t in toppings}
+    cwords = set(colour_name.lower().split())
+    scored = []
+    for r in rows:
+        sc, mx = 0, 10 + 3 + 2 + 3
+        if compact(r["flavour"]) == compact(flavour):
+            sc += 10
+        if compact(r["shape"]) == compact(shape):
+            sc += 3
+        if compact(r["cake_type"]) == compact(cake_type):
+            sc += 2
+        if r["colour"] and cwords & set(r["colour"].lower().split()):
+            sc += 3
+        if want_top:
+            mx += len(want_top)
+            sc += len(want_top & r["toppings"])
+        if sc > 0:
+            scored.append((round(100 * sc / mx), r))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:top_n]
+
+
 def photo_checklist_csv():
     rows = ["category,name,example_file_name"]
     for f in FLAVOURS:
@@ -209,149 +272,10 @@ def nearest_colour_name(hex_colour):
     return best.lower()
 
 
-SHAPE_WORDS = {"Round": "round", "Square": "square", "Rectangle": "rectangular", "Heart": "heart-shaped",
-               "2 Tier": "two-tier", "3 Tier": "three-tier"}
-TYPE_PHRASE = {
-    "Cheesecake": "creamy cheesecake", "Bento Cake": "small bento lunchbox cake", "Birthday Cake": "birthday cake",
-    "Wedding Cake": "elegant wedding cake", "Anniversary Cake": "romantic anniversary cake",
-    "Jar Cake": "layered dessert cake in a glass jar", "Cupcakes": "cupcakes", "Cream Cake": "fresh cream cake",
-    "Tier Cake": "tiered cake", "Drip Cake": "drip cake with chocolate ganache drip",
-}
-
-
-def size_phrase(weight):
-    for kg, inch in ((0.5, 5), (1, 7), (1.5, 8), (2, 9), (3, 10), (4, 12)):
-        if weight <= kg:
-            return f"about {inch} inch wide"
-    return "about 14 inch wide, large"
-
-
-AI_SUFFIX = ("professional bakery photograph, one single cake centred on a cake stand, plain neutral background, "
-             "natural light, sharp focus, neat piping, smooth frosting, no text, no people")
-AI_NEGATIVE = ("other colours, random decorations, extra toppings, text, letters, people, hands, cartoon, "
-               "illustration, painting, 3d render, blurry, messy frosting, uneven piping")
-
-SHAPE_PHRASE = {
-    "Round": "a round cake",
-    "Square": "a square cake",
-    "Rectangle": "a rectangular cake",
-    "Heart": ("a HEART-SHAPED cake, the whole cake is shaped like a heart with two rounded lobes on top and a "
-              "point at the bottom, photographed from above at an angle so the heart outline is clearly visible"),
-    "2 Tier": "a two-tier round cake",
-    "3 Tier": "a three-tier round cake",
-}
-SHAPE_KEY = {"Round": "round", "Square": "square", "Rectangle": "rectang", "Heart": "heart",
-             "2 Tier": "tier", "3 Tier": "tier"}
-TOPPING_PHRASE = {
-    "Fresh Fruits": "fresh strawberries and blueberries", "Chocolate Chips": "chocolate chips",
-    "Sprinkles": "colourful sprinkles", "Oreo": "whole Oreo cookies and Oreo crumbs",
-    "Kitkat / Gems": "KitKat fingers and gems candy", "Edible Flowers": "fresh edible flowers",
-    "Cherries": "red cherries", "Nuts": "chopped nuts", "Macarons": "French macarons",
-    "Pearls": "white sugar pearls", "Gold Foil": "edible gold foil flakes", "Rose Petals": "red rose petals",
-    "Marshmallows": "marshmallows", "Biscuit Crumbs": "Biscoff biscuit crumbs",
-}
-TOPPING_KEY = {"Fresh Fruits": "fruit", "Chocolate Chips": "chip", "Sprinkles": "sprinkle", "Oreo": "oreo",
-               "Kitkat / Gems": "kitkat", "Edible Flowers": "flower", "Cherries": "cherr", "Nuts": "nut",
-               "Macarons": "macaron", "Pearls": "pearl", "Gold Foil": "gold", "Rose Petals": "petal",
-               "Marshmallows": "marshmallow", "Biscuit Crumbs": "biscuit"}
-SPECIAL_TYPES = ("Cupcakes", "Jar Cake", "Bento Cake")
-
-
-def realistic_prompt(colour_name, shape, flavour, cake_type, frosting, toppings, theme, occasion, weight=1.0):
-    """Auto-written prompt. Shape and toppings come FIRST because the AI follows the start of a prompt best."""
-    if cake_type == "Cupcakes":
-        head = f"six {colour_name} {flavour} cupcakes"
-    elif cake_type == "Jar Cake":
-        head = f"a {colour_name} {flavour} layered dessert cake in a glass jar"
-    elif cake_type == "Bento Cake":
-        head = f"a small 4 inch {colour_name} {flavour} bento lunchbox cake in a box"
-    else:
-        head = f"{SHAPE_PHRASE[shape]}, {size_phrase(weight)}, {flavour} {TYPE_PHRASE[cake_type]}"
-    parts = [head]
-    if toppings:
-        parts.append("on top of the cake: " + ", ".join(TOPPING_PHRASE[t] for t in toppings) + ", clearly visible")
-    parts.append(f"the cake is {colour_name} coloured with smooth {frosting.lower()} and neat piped {colour_name} borders")
-    if theme.strip():
-        parts.append(f"{theme.strip()} theme")
-    parts.append(f"{occasion.lower()} cake, only {colour_name} and the natural topping colours")
-    return ", ".join(parts)
-
-
-def ensure_constraints(prompt, shape, cake_type, toppings, colour_name):
-    """If the customer's own prompt forgets the chosen shape / toppings / colour, add them."""
-    low = prompt.lower()
-    front, extra = [], []
-    if cake_type not in SPECIAL_TYPES and SHAPE_KEY[shape] not in low:
-        front.append(SHAPE_PHRASE[shape])
-    missing = [TOPPING_PHRASE[t] for t in toppings if TOPPING_KEY[t] not in low]
-    if missing:
-        extra.append("on top of the cake: " + ", ".join(missing) + ", clearly visible")
-    if not any(w in low for w in colour_name.split()):
-        extra.append(f"the cake is {colour_name} coloured")
-    return ", ".join(front + [prompt] + extra)
-
-
-def realistic_url(prompt, seed, model="flux", size=768, negative=AI_NEGATIVE):
-    return ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
-            + f"?width={size}&height={size}&nologo=true&model={model}&seed={seed}"
-            + "&negative_prompt=" + urllib.parse.quote(negative))
-
-
 def _to_jpeg(img):
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=90)
     return buf.getvalue()
-
-
-def generate_ai_image(prompt, model="flux", size=768, negative_extra="", ref_image=None):
-    """Returns (jpeg_bytes, error, backend_name).
-    1) Hugging Face (if HF_TOKEN secret exists): reference-photo mode, then FLUX.1-dev, then FLUX.1-schnell.
-    2) Free Pollinations as the last option. The image is downloaded once and saved."""
-    full = f"{prompt}, {AI_SUFFIX}"
-    last_err = ""
-    token = get_secret("HF_TOKEN")
-    if token:
-        try:
-            from huggingface_hub import InferenceClient
-            client = InferenceClient(api_key=token)
-            if ref_image is not None:
-                try:
-                    out = client.image_to_image(
-                        _to_jpeg(ref_image),
-                        prompt=f"Make a cake based on this photo, keep its overall shape and style. {full}",
-                        model="black-forest-labs/FLUX.1-Kontext-dev")
-                    return _to_jpeg(out), "", "Hugging Face FLUX Kontext (guided by your reference photo)"
-                except Exception as e:
-                    last_err = f"Reference mode failed: {str(e)[:110]}"
-            for mdl in ("black-forest-labs/FLUX.1-dev", "black-forest-labs/FLUX.1-schnell"):
-                try:
-                    img = client.text_to_image(full, model=mdl, width=size, height=size)
-                    return _to_jpeg(img), "", f"Hugging Face {mdl.split('/')[-1]}"
-                except Exception as e:
-                    last_err = f"HF {mdl.split('/')[-1]}: {str(e)[:110]}"
-        except Exception as e:
-            last_err = f"HF: {str(e)[:110]}"
-    gap = time.time() - st.session_state.get("last_gen", 0)
-    if gap < 8:
-        time.sleep(8 - gap)
-    models = [model] if model == "turbo" else [model, "turbo"]
-    for m in models:
-        url = realistic_url(full, random.randint(1, 99999), m, size, AI_NEGATIVE + negative_extra)
-        for attempt in range(3):
-            try:
-                r = requests.get(url, timeout=50)
-                st.session_state["last_gen"] = time.time()
-                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-                    return _to_jpeg(Image.open(BytesIO(r.content))), "", f"Pollinations ({m})"
-                last_err = f"{m}: HTTP {r.status_code}"
-                if r.status_code in (429, 502, 503):
-                    time.sleep(8)
-                    continue
-                break
-            except Exception as e:
-                last_err = f"{m}: {str(e)[:100]}"
-                break
-    return None, last_err, ""
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -364,7 +288,7 @@ def get_secret(key):
         return None
 
 
-def notify_owner(text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None):
+def notify_owner(text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None, match_bytes=None):
     """Send the order to the owner's Telegram. Returns (ok, error_message)."""
     token = get_secret("TELEGRAM_BOT_TOKEN")
     chat = get_secret("TELEGRAM_CHAT_ID")
@@ -378,6 +302,9 @@ def notify_owner(text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=No
         if photo_bytes:
             requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"Reference image - {order_id}"},
                           files={"photo": ("reference.jpg", photo_bytes)}, timeout=40)
+        if match_bytes:
+            requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"Closest catalog photo - {order_id}"},
+                          files={"photo": ("catalog_match.jpg", match_bytes)}, timeout=40)
         if ai_bytes:
             requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"AI cake preview - {order_id}"},
                           files={"photo": ("ai_preview.jpg", ai_bytes)}, timeout=40)
@@ -407,11 +334,12 @@ def _db():
     con.execute(
         "CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, created TEXT, name TEXT, phone TEXT, "
         "delivery TEXT, need TEXT, cake_type TEXT, flavour TEXT, weight REAL, price INTEGER, status TEXT, "
-        "details TEXT, photo BLOB, design TEXT, ai_image BLOB)"
+        "details TEXT, photo BLOB, design TEXT, ai_image BLOB, match_image BLOB)"
     )
     cols = [r[1] for r in con.execute("PRAGMA table_info(orders)")]
-    if "ai_image" not in cols:  # old database -> add the new column
-        con.execute("ALTER TABLE orders ADD COLUMN ai_image BLOB")
+    for new_col in ("ai_image", "match_image"):  # old database -> add the new columns
+        if new_col not in cols:
+            con.execute(f"ALTER TABLE orders ADD COLUMN {new_col} BLOB")
     return con
 
 
@@ -420,9 +348,9 @@ def save_order(o):
         con = _db()
         con.execute(
             "INSERT INTO orders (order_id, created, name, phone, delivery, need, cake_type, flavour, weight, "
-            "price, status, details, photo, design, ai_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "price, status, details, photo, design, ai_image, match_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (o["order_id"], o["created"], o["name"], o["phone"], o["delivery"], o["need"], o["cake_type"],
-             o["flavour"], o["weight"], o["price"], "New", o["details"], o["photo"], o["design"], o["ai_image"]),
+             o["flavour"], o["weight"], o["price"], "New", o["details"], o["photo"], o["design"], o["ai_image"], o.get("match_image")),
         )
         con.commit()
         con.close()
@@ -455,7 +383,7 @@ def update_status(order_id, status):
     con.close()
 
 
-def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None):
+def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None, match_bytes=None):
     """Email the order to the owner (Gmail + App Password)."""
     user = get_secret("EMAIL_USER")
     pw = get_secret("EMAIL_APP_PASSWORD")
@@ -468,6 +396,8 @@ def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_
         msg.set_content(text)
         if photo_bytes:
             msg.add_attachment(photo_bytes, maintype="image", subtype="jpeg", filename="reference.jpg")
+        if match_bytes:
+            msg.add_attachment(match_bytes, maintype="image", subtype="jpeg", filename="catalog_match.jpg")
         if ai_bytes:
             msg.add_attachment(ai_bytes, maintype="image", subtype="jpeg", filename="ai_preview.jpg")
         if svg_text:
@@ -522,6 +452,8 @@ def owner_dashboard():
     st.text(o["details"])
     if o["photo"]:
         st.image(o["photo"], caption="Customer reference image", width=300)
+    if o.get("match_image"):
+        st.image(o["match_image"], caption="Closest catalog photo (customer's reference)", use_container_width=True)
     if o.get("ai_image"):
         st.image(o["ai_image"], caption="AI generated cake preview", use_container_width=True)
     if o["design"]:
@@ -606,15 +538,28 @@ ref_file = st.file_uploader("Reference Cake Image (optional)")
 # 4. OUTPUT
 # ---------------------------------------------------------------
 st.divider()
-st.header("📸 Matching Cake Photos")
-photos = find_photos(flavour, cake_type, shape)
-if photos:
-    cols = st.columns(2)
-    for i, p in enumerate(photos):
-        cols[i % 2].image(str(p), use_container_width=True)
+st.header("🍰 Your Cake - Real Bakery Photos")
+st.caption("The closest real cakes from our catalog for your flavour, shape, colour and toppings.")
+matches = catalog_matches(flavour, cake_type, shape, nearest_colour_name(colour), toppings)
+top_match_path = None
+top_match_pct = None
+if matches:
+    top_match_pct, top_row = matches[0]
+    top_match_path = top_row["path"]
+    cols = st.columns(len(matches))
+    for col, (pct, r) in zip(cols, matches):
+        col.image(r["path"], use_container_width=True)
+        col.caption(f"{pct}% match • {r['flavour']} • {r['shape']} • {r['colour'] or '-'}")
+    st.caption("The baker will make your cake in the exact colour, shape and toppings you selected above.")
 else:
-    st.info("No matching photos yet. Add photos to the 'cake_photos' folder in GitHub "
-            "(file name like blackforest1.jpg or heart1.jpg - no hyphen needed).")
+    photos = find_photos(flavour, cake_type, shape)
+    if photos:
+        top_match_path = str(photos[0])
+        cols = st.columns(2)
+        for i, p in enumerate(photos):
+            cols[i % 2].image(str(p), use_container_width=True)
+    else:
+        st.info("No catalog photos yet. Add photos to the 'cake_photos' folder and list them in cake_dataset.csv on GitHub.")
 
 st.header("🖼️ Colour Preview (your colour & design)")
 svg = render_cake_svg(
@@ -623,59 +568,6 @@ svg = render_cake_svg(
 )
 show_svg(svg)
 st.caption(f"{colour} {shape} {flavour} {cake_type} • {weight} kg • {frosting}")
-
-st.header("✨ Realistic Cake Image (AI)")
-st.caption("Write what you want to see on your cake. The box is pre-filled from your selections - you can edit it "
-           "or write your own. The more exact your words (colour, shape, toppings), the more accurate the image.")
-auto_prompt = realistic_prompt(nearest_colour_name(colour), shape, flavour, cake_type, frosting, toppings,
-                               theme, occasion, weight)
-# keep the box in sync with the selections until the customer edits it
-if "user_prompt" not in st.session_state or st.session_state.get("last_auto") == st.session_state["user_prompt"]:
-    st.session_state["user_prompt"] = auto_prompt
-st.session_state["last_auto"] = auto_prompt
-
-st.text_area("🖊️ Your cake prompt (write or edit)", key="user_prompt", height=170)
-st.button("🔄 Rewrite prompt from my selections",
-          on_click=lambda: st.session_state.update(user_prompt=st.session_state["last_auto"]))
-c_a, c_b = st.columns(2)
-ai_model = c_a.selectbox("AI model", ["flux", "turbo"], help="flux = more accurate (use this), turbo = faster but weaker")
-ai_quality = c_b.selectbox("Quality", ["Fast (512)", "Better (768)"], index=1)
-use_ref = False
-if ref_file is not None:
-    use_ref = st.checkbox("Use my reference photo to guide the AI image (needs HF_TOKEN)", value=True)
-    if not get_secret("HF_TOKEN"):
-        st.caption("Reference-photo guidance needs the Hugging Face token. Without it the photo is only attached to your order.")
-current_sig = st.session_state["user_prompt"].strip()
-
-if st.button("✨ Generate / Regenerate realistic image"):
-    if not current_sig:
-        st.error("Please write your cake prompt first.")
-    else:
-        colour_nm = nearest_colour_name(colour)
-        final_prompt = ensure_constraints(current_sig, shape, cake_type, toppings, colour_nm)
-        ref_pil = load_reference(ref_file) if (use_ref and ref_file is not None) else None
-        with st.spinner("Generating your cake image... (10-40 seconds)"):
-            img_bytes, img_err, backend = generate_ai_image(
-                final_prompt, ai_model, 768 if "768" in ai_quality else 512,
-                negative_extra=", round cake, circular cake" if (shape == "Heart" and cake_type not in SPECIAL_TYPES) else "",
-                ref_image=ref_pil)
-        if img_bytes:
-            st.session_state["ai_img"] = img_bytes
-            st.session_state["ai_prompt"] = final_prompt
-            st.session_state["ai_sig"] = current_sig
-            st.session_state["ai_backend"] = backend
-            if img_err:
-                st.info(img_err)
-        else:
-            st.error("Could not generate the image right now. Wait 15 seconds and press the button again.")
-            st.caption(img_err)
-if st.session_state.get("ai_img"):
-    st.image(st.session_state["ai_img"], use_container_width=True,
-             caption=f"AI generated by: {st.session_state.get('ai_backend', '')}. Press the button again for another version.")
-    with st.expander("Exact prompt sent to the AI"):
-        st.write(st.session_state.get("ai_prompt", ""))
-    if st.session_state.get("ai_sig") != current_sig:
-        st.warning("You changed your prompt/selections after generating. Press the button again to update the image.")
 
 price, parts = estimate_price(FLAVOURS[flavour][0], weight, cake_type, shape, toppings, topper)
 
@@ -758,13 +650,14 @@ if st.button("✅ Place Order", type="primary"):
             f"Estimated Price: Rs.{price}  (budget: Rs.{budget})",
         ]
         ai_bytes = None
-        if st.session_state.get("ai_img"):
-            if st.session_state.get("ai_sig") == current_sig:
-                ai_bytes = st.session_state["ai_img"]
-                lines += ["", "AI cake preview image: attached", f"AI prompt: {st.session_state.get('ai_prompt', '')}"]
-            else:
-                st.warning("The AI image was made for different options, so it was not attached to this order. "
-                           "Generate it again and place the order again if you want it included.")
+        match_bytes = None
+        if top_match_path:
+            try:
+                match_bytes = _to_jpeg(Image.open(top_match_path))
+                lines += ["", f"Closest catalog photo: {Path(top_match_path).name}"
+                              + (f" ({top_match_pct}% match)" if top_match_pct else "")]
+            except Exception:
+                match_bytes = None
         text = "\n".join(lines)
 
         photo_bytes = None
@@ -781,11 +674,11 @@ if st.button("✅ Place Order", type="primary"):
                 "name": name.strip(), "phone": phone.strip(), "delivery": delivery_type,
                 "need": f"{need_date.strftime('%d %b %Y')} {need_time.strftime('%I:%M %p')}",
                 "cake_type": cake_type, "flavour": flavour, "weight": float(weight), "price": int(price),
-                "details": text, "photo": photo_bytes, "design": svg, "ai_image": ai_bytes,
+                "details": text, "photo": photo_bytes, "design": svg, "ai_image": ai_bytes, "match_image": match_bytes,
             })
             subject = f"New Cake Order #{order_id} - {name.strip()} - Rs.{price}"
-            email_owner(subject, text, photo_bytes, svg, order_id, ai_bytes)
-            notify_owner(text, photo_bytes, svg, order_id, ai_bytes)
+            email_owner(subject, text, photo_bytes, svg, order_id, ai_bytes, match_bytes)
+            notify_owner(text, photo_bytes, svg, order_id, ai_bytes, match_bytes)
         if saved:
             st.success(f"🎉 Order placed! Your Order ID is **{order_id}**. The bakery will contact you on {phone.strip()}.")
             st.balloons()
