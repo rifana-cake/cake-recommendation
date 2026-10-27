@@ -1,11 +1,8 @@
-import base64
 import math
-import random
 import re
 import smtplib
 import sqlite3
 import tempfile
-import time
 import urllib.parse
 from datetime import datetime, time as dtime, timedelta, timezone
 from email.message import EmailMessage
@@ -13,7 +10,6 @@ from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
 from PIL import Image, ImageOps
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -84,6 +80,11 @@ TOPPINGS = {"Fresh Fruits": 100, "Chocolate Chips": 80, "Sprinkles": 50, "Oreo":
 INSTAGRAM_USER = "_femmora.bakes__"
 INSTAGRAM_URL = f"https://www.instagram.com/{INSTAGRAM_USER}/"
 
+
+def instagram_button(**options):
+    """Instagram follow button (a second one needs its own key=...)."""
+    st.link_button(f"📸 Follow @{INSTAGRAM_USER} on Instagram", INSTAGRAM_URL, **options)
+
 PHOTO_DIR = Path(__file__).parent / "cake_photos"
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -93,6 +94,7 @@ PHOTO_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 # ---------------------------------------------------------------
 @st.cache_data
 def flavour_table():
+    """Cake dataset as a Pandas table (flavour, price per kg, tags)."""
     return pd.DataFrame(
         [(n, v[0], v[1]) for n, v in FLAVOURS.items()],
         columns=["flavour", "price_per_kg", "tags"],
@@ -100,10 +102,12 @@ def flavour_table():
 
 
 def suggest_weight(people):
+    """People -> suggested cake weight (about 10 people per kg)."""
     return max(0.5, math.ceil(people / 10 * 2) / 2)  # ~10 people per kg
 
 
 def estimate_price(per_kg, weight, cake_type, shape, toppings, topper):
+    """Price = flavour price x weight + type + shape + toppings + topper. Returns (total, breakdown)."""
     parts = [
         (f"Cake ({weight} kg x Rs.{per_kg})", per_kg * weight),
         (f"Cake type: {cake_type}", CAKE_TYPES[cake_type]),
@@ -118,6 +122,7 @@ def estimate_price(per_kg, weight, cake_type, shape, toppings, topper):
 
 
 def recommend(flavour, occasion, cake_type, theme, top_n=3):
+    """ML: TF-IDF + cosine similarity -> flavours closest to the customer's choices."""
     df = flavour_table()
     docs = df["flavour"].str.lower() + " " + df["tags"]
     vec = TfidfVectorizer()
@@ -132,43 +137,6 @@ def recommend(flavour, occasion, cake_type, theme, top_n=3):
 def compact(text):
     """'Black Forest' / 'black-forest' / 'black_forest' -> 'blackforest'."""
     return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-
-def _longest_match(name, keys):
-    hits = [k for k in keys if k and k in name]
-    return max(hits, key=len) if hits else None
-
-
-def find_photos(flavour, cake_type, shape, limit=6):
-    """Match photos in cake_photos/ by file name. No hyphen needed:
-    blackforest1.jpg, Black Forest 2.jpg, heart_redvelvet.jpg all work."""
-    if not PHOTO_DIR.exists():
-        return []
-    flav_keys = [compact(f) for f in FLAVOURS]
-    type_keys = [compact(t) for t in CAKE_TYPES] + [compact(t).replace("cake", "") for t in CAKE_TYPES]
-    want_flav = compact(flavour)
-    want_types = {compact(cake_type), compact(cake_type).replace("cake", "")}
-    want_shape = compact(shape)
-    scored = []
-    for p in PHOTO_DIR.iterdir():
-        if p.suffix.lower() not in PHOTO_EXT:
-            continue
-        n = compact(p.stem)
-        photo_flav = _longest_match(n, flav_keys)
-        if photo_flav and photo_flav != want_flav:
-            continue  # photo belongs to another flavour
-        photo_type = _longest_match(n, type_keys)
-        score = 0
-        if photo_flav == want_flav:
-            score += 4
-        if photo_type and photo_type in want_types:
-            score += 2
-        if want_shape in n:
-            score += 1
-        if score:
-            scored.append((score, p))
-    scored.sort(key=lambda x: (-x[0], x[1].name))
-    return [p for _, p in scored[:limit]]
 
 
 CATALOG_CSV = Path(__file__).parent / "cake_dataset.csv"
@@ -235,6 +203,7 @@ def catalog_matches(flavour, cake_type, shape, colour_name, toppings, top_n=3):
 
 
 def photo_checklist_csv():
+    """List of photo file names to collect (downloadable from the page footer)."""
     rows = ["category,name,example_file_name"]
     for f in FLAVOURS:
         rows.append(f"flavour,{f},{compact(f)}1.jpg")
@@ -257,7 +226,7 @@ def load_reference(file):
 
 
 def nearest_colour_name(hex_colour):
-    """Hex -> closest named colour (so the AI prompt says 'teal', not '#2a9d8f')."""
+    """Hex colour -> closest named colour (e.g. #e91e8c -> 'hot pink'). Used to match catalog photos."""
     h = hex_colour.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     best, best_d = "pink", 10 ** 9
@@ -273,53 +242,31 @@ def nearest_colour_name(hex_colour):
 
 
 def _to_jpeg(img):
+    """PIL image -> JPEG bytes (for email attachments and the database)."""
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=90)
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------
+# ORDER SYSTEM: database (SQLite) + email + owner dashboard
+# ---------------------------------------------------------------
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def get_secret(key):
+    """Read a password / key from Streamlit Secrets (None if missing)."""
     try:
         return st.secrets[key]
     except Exception:
         return None
 
 
-def notify_owner(text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None, match_bytes=None):
-    """Send the order to the owner's Telegram. Returns (ok, error_message)."""
-    token = get_secret("TELEGRAM_BOT_TOKEN")
-    chat = get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return False, "Owner Telegram is not set up yet."
-    base = f"https://api.telegram.org/bot{token}"
-    try:
-        r = requests.post(f"{base}/sendMessage", data={"chat_id": chat, "text": text}, timeout=20)
-        if not (r.ok and r.json().get("ok")):
-            return False, f"Telegram error: {r.text[:150]}"
-        if photo_bytes:
-            requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"Reference image - {order_id}"},
-                          files={"photo": ("reference.jpg", photo_bytes)}, timeout=40)
-        if match_bytes:
-            requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"Closest catalog photo - {order_id}"},
-                          files={"photo": ("catalog_match.jpg", match_bytes)}, timeout=40)
-        if ai_bytes:
-            requests.post(f"{base}/sendPhoto", data={"chat_id": chat, "caption": f"AI cake preview - {order_id}"},
-                          files={"photo": ("ai_preview.jpg", ai_bytes)}, timeout=40)
-        if svg_text:
-            requests.post(f"{base}/sendDocument", data={"chat_id": chat, "caption": f"Cake design - {order_id} (open in browser)"},
-                          files={"document": (f"{order_id}_design.svg", svg_text.encode(), "image/svg+xml")}, timeout=40)
-        return True, ""
-    except Exception as e:
-        return False, f"Could not reach Telegram: {e}"
-
-
 STATUSES = ["New", "Confirmed", "Preparing", "Ready", "Delivered", "Cancelled"]
 
 
 def _db_path():
+    """Where the orders database file lives."""
     p = Path(__file__).parent / "orders.db"
     try:
         with open(p, "ab"):
@@ -330,27 +277,28 @@ def _db_path():
 
 
 def _db():
+    """Open the orders database (creates the table if needed)."""
     con = sqlite3.connect(_db_path())
     con.execute(
         "CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, created TEXT, name TEXT, phone TEXT, "
         "delivery TEXT, need TEXT, cake_type TEXT, flavour TEXT, weight REAL, price INTEGER, status TEXT, "
-        "details TEXT, photo BLOB, design TEXT, ai_image BLOB, match_image BLOB)"
+        "details TEXT, photo BLOB, design TEXT, match_image BLOB)"
     )
     cols = [r[1] for r in con.execute("PRAGMA table_info(orders)")]
-    for new_col in ("ai_image", "match_image"):  # old database -> add the new columns
-        if new_col not in cols:
-            con.execute(f"ALTER TABLE orders ADD COLUMN {new_col} BLOB")
+    if "match_image" not in cols:  # old database -> add the new column
+        con.execute("ALTER TABLE orders ADD COLUMN match_image BLOB")
     return con
 
 
 def save_order(o):
+    """Save one order in the database. Returns (ok, error)."""
     try:
         con = _db()
         con.execute(
             "INSERT INTO orders (order_id, created, name, phone, delivery, need, cake_type, flavour, weight, "
-            "price, status, details, photo, design, ai_image, match_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "price, status, details, photo, design, match_image) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (o["order_id"], o["created"], o["name"], o["phone"], o["delivery"], o["need"], o["cake_type"],
-             o["flavour"], o["weight"], o["price"], "New", o["details"], o["photo"], o["design"], o["ai_image"], o.get("match_image")),
+             o["flavour"], o["weight"], o["price"], "New", o["details"], o["photo"], o["design"], o["match_image"]),
         )
         con.commit()
         con.close()
@@ -360,6 +308,7 @@ def save_order(o):
 
 
 def list_orders():
+    """All orders as a table (for the dashboard)."""
     con = _db()
     df = pd.read_sql_query(
         "SELECT order_id, created, name, phone, delivery, need, cake_type, flavour, weight, price, status "
@@ -369,6 +318,7 @@ def list_orders():
 
 
 def get_order(order_id):
+    """One order with all its details and images."""
     con = _db()
     con.row_factory = sqlite3.Row
     row = con.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
@@ -377,13 +327,14 @@ def get_order(order_id):
 
 
 def update_status(order_id, status):
+    """Change an order's status (New -> Delivered)."""
     con = _db()
     con.execute("UPDATE orders SET status=? WHERE order_id=?", (status, order_id))
     con.commit()
     con.close()
 
 
-def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_bytes=None, match_bytes=None):
+def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", match_bytes=None):
     """Email the order to the owner (Gmail + App Password)."""
     user = get_secret("EMAIL_USER")
     pw = get_secret("EMAIL_APP_PASSWORD")
@@ -394,12 +345,9 @@ def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_
         msg = EmailMessage()
         msg["Subject"], msg["From"], msg["To"] = subject, user, to
         msg.set_content(text)
-        if photo_bytes:
-            msg.add_attachment(photo_bytes, maintype="image", subtype="jpeg", filename="reference.jpg")
-        if match_bytes:
-            msg.add_attachment(match_bytes, maintype="image", subtype="jpeg", filename="catalog_match.jpg")
-        if ai_bytes:
-            msg.add_attachment(ai_bytes, maintype="image", subtype="jpeg", filename="ai_preview.jpg")
+        for data, fname in ((photo_bytes, "reference.jpg"), (match_bytes, "catalog_match.jpg")):
+            if data:
+                msg.add_attachment(data, maintype="image", subtype="jpeg", filename=fname)
         if svg_text:
             msg.add_attachment(svg_text.encode(), maintype="image", subtype="svg+xml",
                                filename=f"{order_id}_design.svg")
@@ -412,6 +360,7 @@ def email_owner(subject, text, photo_bytes=None, svg_text=None, order_id="", ai_
 
 
 def owner_dashboard():
+    """Password-protected page: orders, images, status update, CSV download."""
     st.title("🔐 Owner Dashboard")
     pw = get_secret("OWNER_PASSWORD")
     if not pw:
@@ -454,8 +403,6 @@ def owner_dashboard():
         st.image(o["photo"], caption="Customer reference image", width=300)
     if o.get("match_image"):
         st.image(o["match_image"], caption="Closest catalog photo (customer's reference)", use_container_width=True)
-    if o.get("ai_image"):
-        st.image(o["ai_image"], caption="AI generated cake preview", use_container_width=True)
     if o["design"]:
         st.image(o["design"], caption="Cake design preview", use_container_width=True)
     new_status = st.selectbox("Order status", STATUSES, index=STATUSES.index(o["status"]), key=f"st_{oid}")
@@ -468,10 +415,6 @@ def owner_dashboard():
     st.link_button("💬 Message customer on WhatsApp", f"https://wa.me/{digits}")
 
 
-def show_svg(svg):
-    st.image(svg, use_container_width=True)
-
-
 # ---------------------------------------------------------------
 # 3. USER INPUT
 # ---------------------------------------------------------------
@@ -482,7 +425,7 @@ if menu == "🔐 Owner Dashboard":
 
 st.title("🎂 AI Bakery Recommendation & Cake Design Assistant")
 st.caption("Customise your cake - the preview updates as you choose.")
-st.link_button(f"📸 Follow @{INSTAGRAM_USER} on Instagram", INSTAGRAM_URL)
+instagram_button()
 
 st.subheader("👤 Customer Details")
 name = st.text_input("Name")
@@ -522,6 +465,7 @@ QUICK = {
 quick = st.selectbox("Cake Colour (28 colours)", list(QUICK.keys()))
 picked = st.color_picker("Custom colour picker (used when 'Custom' is selected)", "#f48fb1")
 colour = QUICK[quick] or picked
+colour_name = nearest_colour_name(colour)
 st.markdown(
     f'<div style="height:30px;border-radius:8px;border:1px solid #888;background:{colour}"></div>',
     unsafe_allow_html=True,
@@ -540,7 +484,7 @@ ref_file = st.file_uploader("Reference Cake Image (optional)")
 st.divider()
 st.header("🍰 Your Cake - Real Bakery Photos")
 st.caption("The closest real cakes from our catalog for your flavour, shape, colour and toppings.")
-matches = catalog_matches(flavour, cake_type, shape, nearest_colour_name(colour), toppings)
+matches = catalog_matches(flavour, cake_type, shape, colour_name, toppings)
 top_match_path = None
 top_match_pct = None
 if matches:
@@ -552,21 +496,14 @@ if matches:
         col.caption(f"{pct}% match • {r['flavour']} • {r['shape']} • {r['colour'] or '-'}")
     st.caption("The baker will make your cake in the exact colour, shape and toppings you selected above.")
 else:
-    photos = find_photos(flavour, cake_type, shape)
-    if photos:
-        top_match_path = str(photos[0])
-        cols = st.columns(2)
-        for i, p in enumerate(photos):
-            cols[i % 2].image(str(p), use_container_width=True)
-    else:
-        st.info("No catalog photos yet. Add photos to the 'cake_photos' folder and list them in cake_dataset.csv on GitHub.")
+    st.info("No catalog photos yet. Add photos to the 'cake_photos' folder and list them in cake_dataset.csv on GitHub.")
 
 st.header("🖼️ Colour Preview (your colour & design)")
 svg = render_cake_svg(
     colour=colour, shape=shape, cake_type=cake_type, weight=weight,
     toppings=toppings, topper=topper, message=message, occasion=occasion, theme=theme,
 )
-show_svg(svg)
+st.image(svg, use_container_width=True)
 st.caption(f"{colour} {shape} {flavour} {cake_type} • {weight} kg • {frosting}")
 
 price, parts = estimate_price(FLAVOURS[flavour][0], weight, cake_type, shape, toppings, topper)
@@ -598,9 +535,9 @@ for _, r in recommend(flavour, occasion, cake_type, theme).iterrows():
     alt_price, _ = estimate_price(r["price_per_kg"], weight, cake_type, shape, toppings, topper)
     st.write(f"• **{r['flavour']}** - ₹{alt_price}")
 
+ref = load_reference(ref_file) if ref_file is not None else None
 if ref_file is not None:
     st.subheader("📷 Your Reference Image")
-    ref = load_reference(ref_file)
     if ref is None:
         st.error("This file could not be read as an image. Please upload a JPG or PNG photo.")
     else:
@@ -626,13 +563,15 @@ if st.button("✅ Place Order", type="primary"):
         st.error("Please enter the delivery address.")
     else:
         order_id = "CK" + datetime.now(IST).strftime("%d%m%H%M%S")
-        colour_label = quick if QUICK[quick] else nearest_colour_name(colour)
+        date_txt = need_date.strftime("%d %b %Y")
+        time_txt = need_time.strftime("%I:%M %p")
+        colour_label = quick if QUICK[quick] else colour_name
         lines = [
             f"🎂 NEW CAKE ORDER  #{order_id}",
             f"Customer: {name.strip()}",
             f"Phone: {phone.strip()}",
             f"{delivery_type}" + (f": {address.strip()}" if address.strip() else ""),
-            f"Required: {need_date.strftime('%d %b %Y')} at {need_time.strftime('%I:%M %p')}",
+            f"Required: {date_txt} at {time_txt}",
             "",
             f"Cake Type: {cake_type}",
             f"Flavour: {flavour}",
@@ -649,7 +588,6 @@ if st.button("✅ Place Order", type="primary"):
             "",
             f"Estimated Price: Rs.{price}  (budget: Rs.{budget})",
         ]
-        ai_bytes = None
         match_bytes = None
         if top_match_path:
             try:
@@ -660,29 +598,22 @@ if st.button("✅ Place Order", type="primary"):
                 match_bytes = None
         text = "\n".join(lines)
 
-        photo_bytes = None
-        if ref_file is not None:
-            ref_img = load_reference(ref_file)
-            if ref_img is not None:
-                buf = BytesIO()
-                ref_img.save(buf, format="JPEG", quality=85)
-                photo_bytes = buf.getvalue()
+        photo_bytes = _to_jpeg(ref) if ref is not None else None
 
         with st.spinner("Placing your order..."):
             saved, db_err = save_order({
                 "order_id": order_id, "created": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
                 "name": name.strip(), "phone": phone.strip(), "delivery": delivery_type,
-                "need": f"{need_date.strftime('%d %b %Y')} {need_time.strftime('%I:%M %p')}",
+                "need": f"{date_txt} {time_txt}",
                 "cake_type": cake_type, "flavour": flavour, "weight": float(weight), "price": int(price),
-                "details": text, "photo": photo_bytes, "design": svg, "ai_image": ai_bytes, "match_image": match_bytes,
+                "details": text, "photo": photo_bytes, "design": svg, "match_image": match_bytes,
             })
             subject = f"New Cake Order #{order_id} - {name.strip()} - Rs.{price}"
-            email_owner(subject, text, photo_bytes, svg, order_id, ai_bytes, match_bytes)
-            notify_owner(text, photo_bytes, svg, order_id, ai_bytes, match_bytes)
+            email_owner(subject, text, photo_bytes, svg, order_id, match_bytes)
         if saved:
             st.success(f"🎉 Order placed! Your Order ID is **{order_id}**. The bakery will contact you on {phone.strip()}.")
             st.balloons()
-            st.link_button(f"📸 Follow @{INSTAGRAM_USER} on Instagram", INSTAGRAM_URL, key="ig_after_order")
+            instagram_button(key="ig_after_order")
         else:
             st.error("Sorry, we could not save your order. Please send it on WhatsApp using the button below.")
             st.caption(db_err)
